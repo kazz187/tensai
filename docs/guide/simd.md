@@ -39,7 +39,9 @@ The tiles leave every finite result bit for bit as the row-at-a-time kernels did
 |---|---|---|
 | `x * w` (`DotInto`) | 13 GFLOP/s | 79–84 GFLOP/s |
 | `x^T * g` (`DotTAInto`) | 13 GFLOP/s | 72–78 GFLOP/s |
-| `g * w^T` (`DotTBInto`) | 33–36 GFLOP/s | 58–79 GFLOP/s |
+| `g * w^T` (`DotTBInto`) | 33–36 GFLOP/s | 68–86 GFLOP/s |
+
+Shapes too small for the tiles — a product of fewer than four rows, the weight gradient of a single sample, an input gradient over fewer than twelve elements — go through the row kernels instead.
 
 The int8/int4 quantized matmuls have their own AVX2 paths built on the 256-bit u8 x s8 pairwise multiply-add — see [Quantization](quantization.md).
 

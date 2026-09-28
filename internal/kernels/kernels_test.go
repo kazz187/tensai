@@ -507,7 +507,7 @@ func BenchmarkGateKernels(b *testing.B) {
 // eight, and row counts that end on the four, two and one kernels.
 func TestDotVecs4MatchesDotVecs(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 4))
-	for _, d := range []int{8, 16, 17, 31, 64, 100, 896} {
+	for _, d := range []int{8, 11, 12, 13, 15, 16, 17, 31, 35, 64, 100, 896} {
 		for _, n := range []int{1, 2, 5, 6, 7, 8, 9, 15, 16, 23} {
 			qs := make([]float32, n*d)
 			for i := range qs {

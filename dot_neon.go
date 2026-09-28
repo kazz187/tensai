@@ -43,7 +43,11 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 
 // dotRowsAxpy computes rows lo..hi, columns c0..b.Cols of out = a * b one
 // row at a time: every nonzero element of a's row scales the matching row
-// of b into the output row.
+// of b into the output row. Both rows are cut to the same length and
+// capacity, so the compiler shares one bounds check between the load of b
+// and the load and store of out at each step; cut by their ends, as they
+// were, the two rows were checked apart, and a single row of 512 ran 1.5
+// times as long.
 func dotRowsAxpy(out, a, b *Matrix, lo, hi, c0 int) {
 	cols := b.Cols
 	width := cols - c0
@@ -51,13 +55,13 @@ func dotRowsAxpy(out, a, b *Matrix, lo, hi, c0 int) {
 	vecs := width &^ 3  // widest multiple of 4
 	for r := lo; r < hi; r++ {
 		aRow := a.Data[r*a.Cols : (r+1)*a.Cols]
-		outRow := out.Data[r*cols+c0 : (r+1)*cols]
+		outRow := out.Data[r*cols+c0:][:width:width]
 		initialized := false
 		for k, av := range aRow {
 			if av == 0 {
 				continue
 			}
-			bRow := b.Data[k*cols+c0 : (k+1)*cols]
+			bRow := b.Data[k*cols+c0:][:width:width]
 			vv := archsimd.BroadcastFloat32x4(av)
 			var c int
 			if !initialized {
@@ -278,10 +282,13 @@ func dotTATallCols(out, a, b *Matrix, lo, hi, k, n, rows, j0, width int) {
 // more output rows run in 4x16 register tiles over the whole contraction,
 // the way dotRows tiles the forward product; the rest goes through the row
 // kernel, which scales b's row into each output row one element of a at a
-// time.
+// time. A contraction of one row -- a single sample's gradient -- gives
+// each output element one multiply-add, which leaves the tiles nothing to
+// hold in registers, so it goes to the row kernel: streaming the output in
+// order, that measured about twice as fast there.
 func dotTARows(out, a, b *Matrix, lo, hi int) {
 	cols := b.Cols
-	if hi-lo >= 4 && cols >= 16 {
+	if hi-lo >= 4 && cols >= 16 && a.Rows >= 2 {
 		i4 := lo + (hi-lo)&^3
 		n16 := cols &^ 15
 		dotTARowsTiled(out, a, b, lo, i4, n16)
@@ -294,7 +301,8 @@ func dotTARows(out, a, b *Matrix, lo, hi int) {
 }
 
 // dotTARowsAxpy adds out rows lo..hi, columns c0..b.Cols of a^T * b: a's
-// element is broadcast against b's row and accumulated into out's row.
+// element is broadcast against b's row and accumulated into out's row,
+// both cut to one length and capacity as dotRowsAxpy cuts them.
 func dotTARowsAxpy(out, a, b *Matrix, lo, hi, c0 int) {
 	cols := b.Cols
 	width := cols - c0
@@ -302,13 +310,13 @@ func dotTARowsAxpy(out, a, b *Matrix, lo, hi, c0 int) {
 	vecs := width &^ 3
 	for r := 0; r < a.Rows; r++ {
 		aRow := a.Data[r*a.Cols : (r+1)*a.Cols]
-		bRow := b.Data[r*cols+c0 : (r+1)*cols]
+		bRow := b.Data[r*cols+c0:][:width:width]
 		for i := lo; i < hi; i++ {
 			av := aRow[i]
 			if av == 0 {
 				continue
 			}
-			outRow := out.Data[i*cols+c0 : (i+1)*cols]
+			outRow := out.Data[i*cols+c0:][:width:width]
 			vv := archsimd.BroadcastFloat32x4(av)
 			var c int
 			for ; c < wide; c += 16 {
