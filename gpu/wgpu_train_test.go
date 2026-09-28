@@ -625,8 +625,12 @@ func TestGPUPermute(t *testing.T) {
 // ones of the same size, which come back out of the pool instead of from
 // the driver and so hold the old values until the clearing kernel runs:
 // they must read back as zeros, with a batch open as well -- where the
-// buffer a dispatch just wrote is handed straight back -- as without.
+// buffer a dispatch just wrote is handed straight back -- as without. It
+// needs the pool, so it opens the device with the default cap whatever
+// TENSAI_GPU_POOL_MB says in the environment: at 0 no buffer would come
+// back, and a value Open rejects would skip the test instead of running it.
 func TestGPUNewZeroTensorReuse(t *testing.T) {
+	t.Setenv("TENSAI_GPU_POOL_MB", "")
 	g := openTestGPU(t)
 	defer g.Close()
 	rng := rand.New(rand.NewPCG(71, 0))
