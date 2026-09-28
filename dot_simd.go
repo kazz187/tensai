@@ -24,6 +24,13 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 		dotRowsGeneric(out, a, b, lo, hi)
 		return
 	}
+	if a.Cols == 0 {
+		// An empty contraction sums nothing: the tiles would leave out as
+		// it was, and the row kernel's bit view of a's row needs an
+		// element to point at.
+		clear(out.Data[lo*b.Cols : hi*b.Cols])
+		return
+	}
 	// Leave the vector unit's upper state clean for surrounding SSE code.
 	defer archsimd.ClearAVXUpperBits()
 
@@ -250,6 +257,11 @@ func dotTATallCols(out, a, b *Matrix, lo, hi, k, n, rows, j0, width int) {
 func dotTARows(out, a, b *Matrix, lo, hi int) {
 	if !simd.HasAVX2 {
 		dotTARowsGeneric(out, a, b, lo, hi)
+		return
+	}
+	if lo >= hi {
+		// No output rows -- a has no columns, and the bit view below
+		// would have no element to point at.
 		return
 	}
 	defer archsimd.ClearAVXUpperBits()

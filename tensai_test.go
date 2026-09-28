@@ -127,6 +127,58 @@ func TestGEMMModes(t *testing.T) {
 	}
 }
 
+// TestGEMMEmptyContraction checks the three products over a contraction of
+// length zero, which have nothing to add up: every element of the output
+// is zero, whatever the buffer held before -- a tape hands out buffers the
+// last step wrote. Some shapes reach the register tiles, whose loop over
+// the contraction never runs, and the rest only the row kernels.
+func TestGEMMEmptyContraction(t *testing.T) {
+	nan := Float(math.NaN())
+	for _, sh := range [][2]int{{4, 16}, {8, 32}, {5, 17}, {16, 16}, {1, 3}, {3, 40}} {
+		m, n := sh[0], sh[1]
+		for _, p := range []struct {
+			name string
+			fn   func(out *Matrix) error
+		}{
+			{"NN", func(out *Matrix) error { return DotInto(out, NewMatrix(m, 0), NewMatrix(0, n)) }},
+			{"NN serial", func(out *Matrix) error { return DotIntoSerial(out, NewMatrix(m, 0), NewMatrix(0, n)) }},
+			{"TN", func(out *Matrix) error { return DotTAInto(out, NewMatrix(0, m), NewMatrix(0, n)) }},
+			{"NT", func(out *Matrix) error { return DotTBInto(out, NewMatrix(m, 0), NewMatrix(n, 0)) }},
+		} {
+			out := NewMatrix(m, n)
+			for i := range out.Data {
+				out.Data[i] = nan
+			}
+			if err := p.fn(out); err != nil {
+				t.Fatal(err)
+			}
+			for i, v := range out.Data {
+				if v != 0 {
+					t.Fatalf("%s %dx0x%d: element %d = %v, want 0", p.name, m, n, i, v)
+				}
+			}
+		}
+	}
+}
+
+// TestGEMMEmptyOutput runs the three products into outputs with no rows or
+// no columns, which have nothing to compute and must not trip over the
+// operands they do get.
+func TestGEMMEmptyOutput(t *testing.T) {
+	for _, sh := range [][3]int{{0, 5, 16}, {4, 5, 0}, {0, 0, 0}, {0, 600, 3}, {4, 600, 0}} {
+		m, k, n := sh[0], sh[1], sh[2]
+		if err := DotInto(NewMatrix(m, n), NewMatrix(m, k), NewMatrix(k, n)); err != nil {
+			t.Fatalf("NN %dx%dx%d: %v", m, k, n, err)
+		}
+		if err := DotTAInto(NewMatrix(m, n), NewMatrix(k, m), NewMatrix(k, n)); err != nil {
+			t.Fatalf("TN %dx%dx%d: %v", m, k, n, err)
+		}
+		if err := DotTBInto(NewMatrix(m, n), NewMatrix(m, k), NewMatrix(n, k)); err != nil {
+			t.Fatalf("NT %dx%dx%d: %v", m, k, n, err)
+		}
+	}
+}
+
 func TestDotVecAxpy(t *testing.T) {
 	rng := rand.New(rand.NewPCG(81, 0))
 	for _, n := range []int{0, 1, 7, 8, 15, 16, 64, 127, 1000} {
