@@ -443,7 +443,8 @@ func TestGPUPermute(t *testing.T) {
 }
 
 // TestGPUEmbed checks the lookup and its scatter-add, with an index that
-// repeats so the atomic path is exercised.
+// repeats so the atomic path is exercised -- and the same scatter through
+// the kernel a backend without those atomics runs instead.
 func TestGPUEmbed(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
@@ -486,23 +487,34 @@ func TestGPUEmbed(t *testing.T) {
 	}
 	defer ggrad.Free()
 	start := randTensor(rng, vocab, dim)
-	gdst, err := g.Upload(start)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gdst.Free()
-	if err := gdst.EmbedGrad(ggrad, gids); err != nil {
-		t.Fatal(err)
-	}
-	gotGrad, err := gdst.Download()
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantGrad := append([]tensai.Float(nil), start.Data...)
 	for i, id := range ids {
 		for j := 0; j < dim; j++ {
 			wantGrad[id*dim+j] += grad.Data[i*dim+j]
 		}
 	}
-	checkClose(t, "embed scatter", gotGrad, wantGrad, 1e-5)
+	atomic := g.pipes.embedScatter
+	defer func() { g.pipes.embedScatter = atomic }()
+	for _, kernel := range []string{"atomic", "columns"} {
+		if kernel == "atomic" && atomic == 0 {
+			t.Logf("no atomic scatter on %s", g.Name())
+			continue
+		}
+		if kernel == "columns" {
+			g.pipes.embedScatter = 0 // what Open leaves when it cannot build it
+		}
+		gdst, err := g.Upload(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := gdst.EmbedGrad(ggrad, gids); err != nil {
+			t.Fatalf("%s: %v", kernel, err)
+		}
+		gotGrad, err := gdst.Download()
+		gdst.Free()
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkClose(t, "embed scatter ("+kernel+")", gotGrad, wantGrad, 1e-5)
+	}
 }
