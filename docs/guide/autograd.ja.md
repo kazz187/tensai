@@ -120,7 +120,7 @@ tape.Bind(params...) // パラメータは一度アップロードされて常�
 
 `Value()` と `Grad()` は必要になった時点でダウンロードするので、ノードを読むコードはそのまま動きます — これがフィールドではなくメソッドである理由です。`Resident()` は値が今どちらにあるかを返します。
 
-デバイスにカーネルがある演算はデバイスで走り、それ以外は CPU にフォールバックして、その演算に必要なぶんだけ持ち帰ります。対象は 3 つの積、繰り返しオペランドを許す要素ごとの演算、`Scale`、ReLU/tanh/sigmoid/GELU とその勾配、`LayerNorm`、`Softmax`、`Transpose`、`Reshape`、`Embed` (scatter-add 込み)、ブロードキャストの集約、そして Adam の更新 — つまり transformer ブロックはまるごと常駐し、バスを渡るのは損失だけです。
+デバイスにカーネルがある演算はデバイスで走り、それ以外は CPU にフォールバックして、その演算に必要なぶんだけ持ち帰ります。対象は 3 つの積、CPU と同じ NumPy 式ブロードキャストでの要素ごとの加減乗算 (`(batch, 1, 1, seq)` のマスクも含む)、`Scale`、ReLU/tanh/sigmoid/GELU とその勾配、`LayerNorm`、`Softmax`、`Transpose`、`Reshape`、`Embed` (scatter-add 込み)、ブロードキャストの集約、そして Adam の更新 — つまり transformer ブロックはまるごと常駐し、バスを渡るのは損失だけです。
 
 `-tags wgpu24` 経由の AMD 780M で、`x @ w1 -> GELU -> @ w2 -> MSE` の 1 ステップ:
 

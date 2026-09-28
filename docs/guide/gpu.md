@@ -96,8 +96,9 @@ Those are the products. The rest of a backward pass is there too, as resident ke
 ```go
 h, _ := gx.MatMul(gw)               // forward
 a, _ := h.Activate(gpu.ActGELU)     // and h.ActivateGrad(gpu.ActGELU, grad) on the way back
-s, _ := a.Binary(gpu.OpMul, gscale) // add, sub, mul, div; a shorter operand repeats
+s, _ := a.Binary(gpu.OpMul, gscale) // add, sub, mul, div, broadcasting NumPy-style
 db, _ := gdelta.SumCols()           // the gradient of a row broadcast over a batch
+dm, _ := gdelta.SumTo(b, 1, 1, t)   // ...and of any broadcast, summed back to its shape
 gw.AdamStep(ggrad, gm, gv, lr, b1, b2, rc1, rc2, eps, 0)
 ```
 

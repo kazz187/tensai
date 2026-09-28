@@ -206,9 +206,9 @@ func devNode(op string, v *gpu.Tensor, shape []int, parents ...*Node) *Node {
 	return out
 }
 
-// devAccum adds g into n's device gradient, summing over a leading axis the
+// devAccum adds g into n's device gradient, summing over the axes the
 // operand was broadcast along. It reports false when the reduction is not
-// one the device kernels can do, which sends the whole op back to the CPU.
+// one the device kernels can do.
 func devAccum(n *Node, g *gpu.Tensor, gShape []int) bool {
 	dst, ok := n.residentGrad()
 	if !ok {
@@ -220,13 +220,15 @@ func devAccum(n *Node, g *gpu.Tensor, gShape []int) bool {
 	case cols == total:
 		// Shapes agree; the add below is all that is needed.
 	case cols != 0 && total > cols && total%cols == 0:
-		// The operand was broadcast over a repeating leading block, so its
-		// gradient is the column sums of that block.
-		flat, err := g.View(0, total/cols, cols)
+		// The operand was broadcast, so its gradient is the sum over every
+		// axis it was stretched along -- leading ones for a bias, inner
+		// ones of length 1 for a (batch, 1, seq) mask. g's buffer may be a
+		// flatter view of gShape, so it is read as gShape.
+		full, err := g.View(0, gShape...)
 		if err != nil {
 			return false
 		}
-		summed, err := flat.SumCols()
+		summed, err := full.SumTo(n.Shape()...)
 		if err != nil {
 			return false
 		}
@@ -313,17 +315,17 @@ func devProduct(a, b *gpu.Tensor, mode gemmMode) (*gpu.Tensor, error) {
 	}
 }
 
-// devBinary runs an element-wise op on the device. The kernels broadcast an
-// operand that repeats into the output, which covers a bias row or a
-// per-feature scale; anything else goes back to the CPU.
+// devBinary runs an element-wise op on the device, broadcasting the
+// operands the NumPy way as the CPU op does; the backward pass sums each
+// gradient back over the axes its operand was stretched along.
 func devBinary(op gpu.BinOp, n, o *Node) (*Node, bool) {
 	if tapeOf(n, o).Device() == nil {
 		return nil, false
 	}
 	tapeOf(n, o).openBatch()
-	shape, ok := devBinShape(n.Shape(), o.Shape())
-	if !ok {
-		return nil, false
+	shape, err := dims.Broadcast(n.Shape(), o.Shape())
+	if err != nil {
+		return nil, false // the CPU op reports it
 	}
 	tp := tapeOf(n, o)
 	ga, ok := n.resident(tp)
@@ -333,9 +335,6 @@ func devBinary(op gpu.BinOp, n, o *Node) (*Node, bool) {
 	gb, ok := o.resident(tp)
 	if !ok {
 		return nil, false
-	}
-	if dims.Prod(o.Shape()) > dims.Prod(n.Shape()) {
-		return nil, false // only the right operand may repeat
 	}
 	gc, err := ga.Binary(op, gb)
 	if err != nil {
@@ -411,28 +410,6 @@ func scalarTensor(v tensai.Float) *tensai.Tensor {
 	t := tensai.NewTensor(1)
 	t.Data[0] = v
 	return t
-}
-
-// devBinShape returns the output shape of an element-wise op the device can
-// run: the shapes must match, or the second must repeat into the first.
-func devBinShape(a, b []int) ([]int, bool) {
-	na, nb := dims.Prod(a), dims.Prod(b)
-	if dims.Same(a, b) {
-		return a, true
-	}
-	if nb == 0 || na%nb != 0 {
-		return nil, false
-	}
-	// Only a trailing block that repeats is expressible; check that b is
-	// the tail of a.
-	for i := 1; i <= len(b); i++ {
-		if i > len(a) || a[len(a)-i] != b[len(b)-i] {
-			if b[len(b)-i] != 1 {
-				return nil, false
-			}
-		}
-	}
-	return a, true
 }
 
 // opName labels a device op in ToDot the way its CPU twin does.

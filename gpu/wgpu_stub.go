@@ -130,6 +130,9 @@ func (t *Tensor) Permute(perm ...int) (*Tensor, error) { return nil, errNoWGPU }
 // SumCols is a no-op stub; build with -tags wgpu or wgpu24.
 func (t *Tensor) SumCols() (*Tensor, error) { return nil, errNoWGPU }
 
+// SumTo is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) SumTo(shape ...int) (*Tensor, error) { return nil, errNoWGPU }
+
 // AdamStep is a no-op stub; build with -tags wgpu or wgpu24.
 func (t *Tensor) AdamStep(grad, m, v *Tensor, lr, beta1, beta2, rc1, rc2, eps, decay tensai.Float) error {
 	return errNoWGPU

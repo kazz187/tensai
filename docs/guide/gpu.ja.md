@@ -96,8 +96,9 @@ if err == nil {
 ```go
 h, _ := gx.MatMul(gw)               // 順伝播
 a, _ := h.Activate(gpu.ActGELU)     // 戻りは h.ActivateGrad(gpu.ActGELU, grad)
-s, _ := a.Binary(gpu.OpMul, gscale) // add, sub, mul, div。短いオペランドは繰り返す
+s, _ := a.Binary(gpu.OpMul, gscale) // add, sub, mul, div。NumPy と同じブロードキャスト
 db, _ := gdelta.SumCols()           // バッチにブロードキャストした行の勾配
+dm, _ := gdelta.SumTo(b, 1, 1, t)   // 任意のブロードキャストの勾配を元の形へ集約
 gw.AdamStep(ggrad, gm, gv, lr, b1, b2, rc1, rc2, eps, 0)
 ```
 

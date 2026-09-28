@@ -120,7 +120,7 @@ tape.Bind(params...) // parameters upload once and stay resident
 
 `Value()` and `Grad()` download on demand, so reading a node still works — that is what makes them methods. `Resident()` reports where a node's value currently is.
 
-Operations the device has kernels for run there; anything else falls back to the CPU, bringing home only what that operation needs. That covers the three products, element-wise arithmetic with a repeating operand, `Scale`, ReLU/tanh/sigmoid/GELU and their gradients, `LayerNorm`, `Softmax`, `Transpose`, `Reshape`, `Embed` (its scatter-add included), the sum a broadcast collects, and the Adam update — so a whole transformer block stays resident, and only the loss crosses the bus.
+Operations the device has kernels for run there; anything else falls back to the CPU, bringing home only what that operation needs. That covers the three products, element-wise add, subtract and multiply under the same NumPy broadcasting as the CPU (a `(batch, 1, 1, seq)` mask included), `Scale`, ReLU/tanh/sigmoid/GELU and their gradients, `LayerNorm`, `Softmax`, `Transpose`, `Reshape`, `Embed` (its scatter-add included), the sum a broadcast collects, and the Adam update — so a whole transformer block stays resident, and only the loss crosses the bus.
 
 On an AMD 780M through `-tags wgpu24`, one step of `x @ w1 -> GELU -> @ w2 -> MSE`:
 

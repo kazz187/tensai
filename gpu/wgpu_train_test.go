@@ -3,11 +3,13 @@
 package gpu
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/dims"
 	"github.com/mattn/tensai/internal/kernels"
 )
 
@@ -83,6 +85,183 @@ func TestGPUBinaryOps(t *testing.T) {
 	defer odd.Free()
 	if _, err := gx.Binary(OpAdd, odd); err == nil {
 		t.Error("expected a broadcast error")
+	}
+}
+
+// broadcastPairs are shape pairs NumPy broadcasts, chosen to cover each
+// way an operand can be stretched: a trailing block, an axis of length 1
+// in the middle (the pairs that used to wrap cyclically and come out
+// wrong without a word), both sides at once, the left side only, and a
+// rank-six walk that merges to six axes.
+var broadcastPairs = [][2][]int{
+	{{6, 8}, {6, 8}},
+	{{4, 6, 8}, {8}},
+	{{4, 6, 8}, {1, 1, 8}},
+	{{6, 8}, {1}},
+	{{2, 3, 4, 4}, {3, 4, 4}},
+	{{2, 3, 4, 4}, {3, 1, 4}},    // (heads, batch, seq, seq) + (batch, 1, seq)
+	{{3, 2, 4, 4}, {3, 1, 1, 4}}, // a key-padding mask over (batch, heads, seq, seq)
+	{{5, 4}, {5, 1}},             // a column: (batch, options) - (batch, 1)
+	{{5, 1}, {1, 4}},             // both sides stretch
+	{{1, 4}, {5, 1}},
+	{{4}, {3, 4}}, // only the left side stretches
+	{{3, 1}, {3, 5}},
+	{{3, 1, 5}, {1, 4, 1}},
+	{{2, 1, 3, 1}, {1, 5, 1, 4}},
+	{{7, 1, 1, 9}, {1, 3, 2, 1}},
+	{{2, 3, 1, 5, 1, 2}, {3, 4, 1, 6, 1}},
+	{{300, 1, 17}, {1, 5, 17}}, // more than one workgroup
+}
+
+// TestGPUBinaryBroadcast checks every op over shape pairs NumPy broadcasts
+// against the CPU's broadcasting arithmetic, element for element.
+func TestGPUBinaryBroadcast(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewPCG(33, 0))
+
+	ops := []struct {
+		name string
+		op   BinOp
+		cpu  func(a, b *tensai.Tensor) (*tensai.Tensor, error)
+	}{
+		{"add", OpAdd, (*tensai.Tensor).Add},
+		{"sub", OpSub, (*tensai.Tensor).Sub},
+		{"mul", OpMul, (*tensai.Tensor).Mul},
+		{"div", OpDiv, (*tensai.Tensor).Div},
+	}
+	for _, pair := range broadcastPairs {
+		a, b := randTensor(rng, pair[0]...), randTensor(rng, pair[1]...)
+		for i := range b.Data {
+			b.Data[i] += 3 // keep division well conditioned
+		}
+		ga, gb := upload2(t, g, a, b)
+		for _, o := range ops {
+			want, err := o.cpu(a, b)
+			if err != nil {
+				t.Fatalf("cpu %s %v %v: %v", o.name, pair[0], pair[1], err)
+			}
+			out, err := ga.Binary(o.op, gb)
+			if err != nil {
+				t.Fatalf("%s %v %v: %v", o.name, pair[0], pair[1], err)
+			}
+			if !dims.Same(out.Shape(), want.Shape) {
+				t.Fatalf("%s %v %v: shape %v, want %v", o.name, pair[0], pair[1], out.Shape(), want.Shape)
+			}
+			got, err := out.Download()
+			out.Free()
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkClose(t, fmt.Sprintf("%s %v %v", o.name, pair[0], pair[1]), got, want.Data, 1e-6)
+		}
+		ga.Free()
+		gb.Free()
+	}
+
+	// Shapes NumPy cannot broadcast are refused -- including ones whose
+	// sizes divide, which the cyclic kernel alone would have taken.
+	for _, pair := range [][2][]int{{{6, 8}, {5}}, {{6, 8}, {2, 4}}, {{6, 8}, {8, 1}}} {
+		ga, gb := upload2(t, g, randTensor(rng, pair[0]...), randTensor(rng, pair[1]...))
+		if out, err := ga.Binary(OpAdd, gb); err == nil {
+			out.Free()
+			t.Errorf("%v + %v: expected a broadcast error", pair[0], pair[1])
+		}
+		ga.Free()
+		gb.Free()
+	}
+	// A walk longer than the kernels take is an error too, not a guess.
+	long := [2][]int{{2, 1, 2, 1, 2, 1, 2, 1, 2}, {1, 2, 1, 2, 1, 2, 1, 2, 1}}
+	ga, gb := upload2(t, g, randTensor(rng, long[0]...), randTensor(rng, long[1]...))
+	defer ga.Free()
+	defer gb.Free()
+	if out, err := ga.Binary(OpAdd, gb); err == nil {
+		out.Free()
+		t.Errorf("%v + %v merges to nine axes: expected an error", long[0], long[1])
+	}
+}
+
+// sumToRef sums x down to shape on the host, in float64.
+func sumToRef(x *tensai.Tensor, shape []int) []tensai.Float {
+	strides := dims.BroadcastStrides(shape, x.Shape)
+	sums := make([]float64, dims.Prod(shape))
+	idx := make([]int, len(x.Shape))
+	for _, v := range x.Data {
+		off := 0
+		for d, i := range idx {
+			off += i * strides[d]
+		}
+		sums[off] += float64(v)
+		for d := len(idx) - 1; d >= 0; d-- {
+			if idx[d]++; idx[d] < x.Shape[d] {
+				break
+			}
+			idx[d] = 0
+		}
+	}
+	out := make([]tensai.Float, len(sums))
+	for i, v := range sums {
+		out[i] = tensai.Float(v)
+	}
+	return out
+}
+
+// TestGPUSumTo checks the reduction a broadcast operand's gradient takes,
+// for the operand side of every pair TestGPUBinaryBroadcast runs and a few
+// more: a block of rows, everything into one element, and no reduction.
+func TestGPUSumTo(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewPCG(35, 0))
+
+	cases := [][2][]int{
+		{{4, 6, 8}, {1, 6, 1}},
+		{{4, 6, 8}, {1}},
+		{{4, 6, 8}, {1, 1, 1}},
+		{{4, 6, 8}, {4, 6, 8}},
+		{{1000, 3}, {3}},
+	}
+	for _, pair := range broadcastPairs {
+		out, err := dims.Broadcast(pair[0], pair[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases = append(cases, [2][]int{out, pair[0]}, [2][]int{out, pair[1]})
+	}
+	for _, c := range cases {
+		x := randTensor(rng, c[0]...)
+		gx, err := g.Upload(x)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := gx.SumTo(c[1]...)
+		gx.Free()
+		if err != nil {
+			t.Fatalf("%v to %v: %v", c[0], c[1], err)
+		}
+		if !dims.Same(out.Shape(), c[1]) {
+			t.Fatalf("%v to %v: shape %v", c[0], c[1], out.Shape())
+		}
+		got, err := out.Download()
+		out.Free()
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkClose(t, fmt.Sprintf("sum %v to %v", c[0], c[1]), got, sumToRef(x, c[1]), 1e-4)
+	}
+
+	gx, err := g.Upload(randTensor(rng, 4, 6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gx.Free()
+	if out, err := gx.SumTo(4, 1, 6); err == nil {
+		out.Free()
+		t.Error("summing (4, 6) to a larger shape should fail")
+	}
+	if out, err := gx.SumTo(3); err == nil {
+		out.Free()
+		t.Error("summing (4, 6) to (3) should fail")
 	}
 }
 
