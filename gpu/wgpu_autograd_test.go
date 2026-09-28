@@ -3,6 +3,7 @@
 package gpu_test
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"testing"
@@ -275,6 +276,84 @@ func TestGPUResidentTransformer(t *testing.T) {
 		for j := range want.Data {
 			if diff := math.Abs(float64(want.Data[j] - got.Data[j])); diff > 2e-2*(1+math.Abs(float64(want.Data[j]))) {
 				t.Fatalf("%s element %d: cpu=%v device=%v", names[i], j, want.Data[j], got.Data[j])
+			}
+		}
+	}
+}
+
+// TestGPUResidentBroadcast runs element-wise ops whose operands NumPy
+// broadcasts -- along leading axes, along inner axes of length 1, on both
+// sides at once -- on a device tape and on the CPU, and checks that the
+// graph stays resident and that the value and both operands' gradients
+// agree. A weight of random values after the op keeps the gradients from
+// being the plain counts a sum would give.
+func TestGPUResidentBroadcast(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	pairs := [][2][]int{
+		{{4, 6, 8}, {8}},
+		{{2, 3, 4, 4}, {3, 1, 4}},
+		{{3, 2, 4, 4}, {3, 1, 1, 4}},
+		{{5, 4}, {5, 1}},
+		{{5, 1}, {1, 4}},
+		{{4}, {3, 4}},
+		{{2, 1, 3, 1}, {1, 5, 1, 4}},
+	}
+	ops := []struct {
+		name string
+		fn   func(a, b *autograd.Node) *autograd.Node
+	}{
+		{"add", (*autograd.Node).Add},
+		{"sub", (*autograd.Node).Sub},
+		{"mul", (*autograd.Node).Mul},
+	}
+	for pi, pair := range pairs {
+		for _, op := range ops {
+			run := func(dev *gpu.Device) (value tensai.Float, ga, gb *tensai.Tensor, resident bool) {
+				rng := rand.New(rand.NewPCG(401, uint64(pi)))
+				a := autograd.Param(randTensor(rng, pair[0]...))
+				b := autograd.Param(randTensor(rng, pair[1]...))
+				out, err := tensai.NewTensor(pair[0]...).Add(tensai.NewTensor(pair[1]...))
+				if err != nil {
+					t.Fatal(err)
+				}
+				w := randTensor(rng, out.Shape...)
+				tape := autograd.NewTape()
+				if dev != nil {
+					tape.UseDevice(dev)
+				}
+				tape.Bind(a, b)
+				y := op.fn(a, b)
+				resident = y.Resident()
+				loss := y.Mul(autograd.Input(w)).Sum()
+				loss.Backward()
+				value = loss.Scalar()
+				ga, gb = a.Grad().Clone(), b.Grad().Clone()
+				tape.Reset()
+				return value, ga, gb, resident
+			}
+			name := fmt.Sprintf("%s %v %v", op.name, pair[0], pair[1])
+			wantV, wantA, wantB, _ := run(nil)
+			gotV, gotA, gotB, resident := run(g)
+			if !resident {
+				t.Errorf("%s left the device", name)
+			}
+			if diff := math.Abs(float64(gotV - wantV)); diff > 1e-4*(1+math.Abs(float64(wantV))) {
+				t.Errorf("%s: loss device=%v cpu=%v", name, gotV, wantV)
+			}
+			for _, gr := range []struct {
+				side      string
+				got, want *tensai.Tensor
+			}{{"a", gotA, wantA}, {"b", gotB, wantB}} {
+				if len(gr.got.Data) != len(gr.want.Data) {
+					t.Fatalf("%s: grad %s has %d elements, want %d", name, gr.side, len(gr.got.Data), len(gr.want.Data))
+				}
+				for i := range gr.want.Data {
+					if diff := math.Abs(float64(gr.got.Data[i] - gr.want.Data[i])); diff > 1e-4*(1+math.Abs(float64(gr.want.Data[i]))) {
+						t.Fatalf("%s: grad %s element %d: device=%v cpu=%v", name, gr.side, i, gr.got.Data[i], gr.want.Data[i])
+					}
+				}
 			}
 		}
 	}

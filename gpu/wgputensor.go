@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"slices"
 	"unsafe"
 
 	"github.com/mattn/tensai"
@@ -1624,10 +1625,10 @@ fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
 // itself -- without them a training graph has to come back to the host
 // between every product.
 //
-// Operands broadcast cyclically: an operand shorter than the output
-// repeats, which covers the trailing-axis broadcasts training uses (a bias
-// over rows, a per-feature gain over a batch). Anything else is rejected
-// on the Go side.
+// bin_op broadcasts cyclically: an operand shorter than the output
+// repeats, which covers the trailing-axis broadcasts training uses most (a
+// bias over rows, a per-feature gain over a batch). bin_op_nd below walks
+// the axes for every other NumPy broadcast.
 struct TrainParams {
     count: u32, aCount: u32, bCount: u32, mode: u32,
     rows: u32, lr: f32, beta1: f32, beta2: f32,
@@ -1697,6 +1698,99 @@ fn bin_op(@builtin(workgroup_id) wg: vec3<u32>,
         case 2u: { tout[idx] = x * y; }
         default: { tout[idx] = x / y; }
     }
+}
+
+// BcastParams describes a broadcast by its axes, merged on the Go side
+// so that no two neighbours are stretched the same way (at most eight
+// remain). For bin_op_nd, shape is the output's and strideA and strideB
+// step through the two operands along each axis, 0 along one an operand
+// is stretched over. For sum_bcast, strideA steps through the full-shape
+// source and strideB is 0 along every axis to sum over; reps is how many
+// source elements each output element sums.
+struct BcastParams {
+    count: u32, rank: u32, mode: u32, reps: u32,
+    shape: array<vec4<u32>, 2>,
+    strideA: array<vec4<u32>, 2>,
+    strideB: array<vec4<u32>, 2>,
+}
+@group(0) @binding(58) var<uniform> bcp: BcastParams;
+
+// The per-axis lanes of BcastParams, indexed in place: an array value
+// passed to a function cannot be indexed by a runtime axis everywhere.
+fn bc_shape(axis: u32) -> u32 { return bcp.shape[axis / 4u][axis % 4u]; }
+fn bc_stride_a(axis: u32) -> u32 { return bcp.strideA[axis / 4u][axis % 4u]; }
+fn bc_stride_b(axis: u32) -> u32 { return bcp.strideB[axis / 4u][axis % 4u]; }
+
+// bin_op_nd is bin_op for any broadcast: a (batch, 1, 1, seq) key mask
+// over (batch, heads, seq, seq) scores, a (rows, 1) column over
+// (rows, cols). Each output element finds its operands by walking the
+// output's coordinates, so neither side is materialized at the full size.
+@compute @workgroup_size(256, 1, 1)
+fn bin_op_nd(@builtin(workgroup_id) wg: vec3<u32>,
+             @builtin(num_workgroups) nwg: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx >= bcp.count) {
+        return;
+    }
+    var rem = idx;
+    var ia = 0u;
+    var ib = 0u;
+    for (var d = bcp.rank; d > 0u; d = d - 1u) {
+        let axis = d - 1u;
+        let size = bc_shape(axis);
+        let i = rem % size;
+        rem = rem / size;
+        ia = ia + i * bc_stride_a(axis);
+        ib = ib + i * bc_stride_b(axis);
+    }
+    let x = ta[ia];
+    let y = tb[ib];
+    switch bcp.mode {
+        case 0u: { tout[idx] = x + y; }
+        case 1u: { tout[idx] = x - y; }
+        case 2u: { tout[idx] = x * y; }
+        default: { tout[idx] = x / y; }
+    }
+}
+
+// sum_bcast is the adjoint of a broadcast: it folds a full-shape gradient
+// back onto an operand by summing over the axes the operand was stretched
+// along, one output element per thread. The kept axes place the thread's
+// first source element; the summed ones are then walked reps times.
+@compute @workgroup_size(256, 1, 1)
+fn sum_bcast(@builtin(workgroup_id) wg: vec3<u32>,
+             @builtin(num_workgroups) nwg: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx >= bcp.count) {
+        return;
+    }
+    var rem = idx;
+    var base = 0u;
+    for (var d = bcp.rank; d > 0u; d = d - 1u) {
+        let axis = d - 1u;
+        if (bc_stride_b(axis) != 0u) {
+            let size = bc_shape(axis);
+            base = base + (rem % size) * bc_stride_a(axis);
+            rem = rem / size;
+        }
+    }
+    var sum = 0.0;
+    for (var j = 0u; j < bcp.reps; j = j + 1u) {
+        var r = j;
+        var off = base;
+        for (var d = bcp.rank; d > 0u; d = d - 1u) {
+            let axis = d - 1u;
+            if (bc_stride_b(axis) == 0u) {
+                let size = bc_shape(axis);
+                off = off + (r % size) * bc_stride_a(axis);
+                r = r / size;
+            }
+        }
+        sum = sum + ta[off];
+    }
+    tout[idx] = sum;
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -2869,6 +2963,7 @@ type gpuPipelines struct {
 	layMatmulTN, layMatmulTNS                      uintptr
 	binOp, actFwd, actBwd, sumCols, adamStep       uintptr
 	layBinOp, layActFwd, layActBwd                 uintptr
+	binOpND, sumBcast, layBinOpND, laySumBcast     uintptr
 	laySumCols, layAdamStep                        uintptr
 	matmulL, matmulLT, matmulLTN                   uintptr
 	matmulV4, matmulV4T, matmulV4TN                uintptr
@@ -2937,6 +3032,8 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.sliceCols, &g.pipes.laySliceCols, "slice_cols"},
 		{&g.pipes.gluSplit, &g.pipes.layGluSplit, "glu_split"},
 		{&g.pipes.binOp, &g.pipes.layBinOp, "bin_op"},
+		{&g.pipes.binOpND, &g.pipes.layBinOpND, "bin_op_nd"},
+		{&g.pipes.sumBcast, &g.pipes.laySumBcast, "sum_bcast"},
 		{&g.pipes.actFwd, &g.pipes.layActFwd, "act_fwd"},
 		{&g.pipes.actBwd, &g.pipes.layActBwd, "act_bwd"},
 		{&g.pipes.sumCols, &g.pipes.laySumCols, "sum_cols"},
@@ -4373,6 +4470,18 @@ const trainParamBytes = 48
 // allocating the (outShape) result it writes. a binds to 47, b -- which may
 // be nil -- to 48, and the result to 49.
 func (g *Device) trainOp(pipe, lay uintptr, p trainParams, count int, outShape []int, a, b *Tensor) (*Tensor, error) {
+	return g.elementOp(pipe, lay, 46, unsafe.Pointer(&p), trainParamBytes, count, outShape, a, b)
+}
+
+// bcastOp is trainOp for the kernels that read a BcastParams uniform.
+func (g *Device) bcastOp(pipe, lay uintptr, p bcastParams, count int, outShape []int, a, b *Tensor) (*Tensor, error) {
+	return g.elementOp(pipe, lay, 58, unsafe.Pointer(&p), bcastParamBytes, count, outShape, a, b)
+}
+
+// elementOp dispatches one thread per output element of a kernel whose
+// parameter block, paramBytes at params, binds to paramBinding; the
+// operands and result bind as trainOp says.
+func (g *Device) elementOp(pipe, lay uintptr, paramBinding uint32, params unsafe.Pointer, paramBytes uint64, count int, outShape []int, a, b *Tensor) (*Tensor, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	wgpuMu.Lock()
@@ -4386,14 +4495,14 @@ func (g *Device) trainOp(pipe, lay uintptr, p trainParams, count int, outShape [
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes, bufParams)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&p), trainParamBytes)
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, paramBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, paramBytes, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, params, uintptr(paramBytes))
 	bufOut := g.takeOutBuffer(outBytes)
 
 	entries := make([]wgpuBindGroupEntry, 0, 4)
 	entries = append(entries,
-		wgpuBindGroupEntry{binding: 46, buffer: bufParams, size: trainParamBytes},
+		wgpuBindGroupEntry{binding: paramBinding, buffer: bufParams, size: paramBytes},
 		bind(47, a))
 	if b != nil {
 		entries = append(entries, bind(48, b))
@@ -4410,18 +4519,78 @@ func (g *Device) trainOp(pipe, lay uintptr, p trainParams, count int, outShape [
 	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), outShape...)}, nil
 }
 
-// broadcastCount checks that n elements repeat cyclically into count, which
-// is the broadcast the kernels can express.
-func broadcastCount(count, n int) (uint32, error) {
-	if n == 0 || count%n != 0 {
-		return 0, fmt.Errorf("tensai: gpu cannot broadcast %d elements into %d", n, count)
-	}
-	return uint32(n), nil
+// maxBcastAxes is how many merged axes bin_op_nd and sum_bcast walk: the
+// uniform holds two vec4 lanes of each per-axis value.
+const maxBcastAxes = 8
+
+// bcastParams mirrors BcastParams in the WGSL.
+type bcastParams struct {
+	count, rank, mode, reps uint32
+	shape, strideA, strideB [maxBcastAxes]uint32
 }
 
-// Binary returns t op o element-wise. o may be shorter than t as long as it
-// divides it, in which case it repeats -- the trailing-axis broadcast of a
-// bias or a per-feature scale.
+const bcastParamBytes = 16 + 3*4*maxBcastAxes
+
+// mergeAxes describes a walk over the shape out in as few axes as it
+// takes. Each of strides gives, per axis of out, the step through one
+// operand -- 0 along an axis the operand is stretched over, as
+// dims.BroadcastStrides reports. Axes of length 1 are dropped, and
+// neighbours that every operand treats alike, stretching along both or
+// neither, join into one axis that steps by the inner one's stride (the
+// operands are contiguous, so the outer stride is that times the inner
+// length). A bias over (batch, seq, dim) comes out as two axes, a
+// (batch, 1, 1, seq) mask over (batch, heads, seq, seq) as three.
+func mergeAxes(out []int, strides ...[]int) (shape []int, merged [][]int) {
+	merged = make([][]int, len(strides))
+	for d := len(out) - 1; d >= 0; d-- {
+		if out[d] == 1 {
+			continue
+		}
+		n := len(shape)
+		join := n > 0
+		for i, st := range strides {
+			if join && (st[d] == 0) != (merged[i][n-1] == 0) {
+				join = false
+			}
+		}
+		if join {
+			shape[n-1] *= out[d]
+			continue
+		}
+		shape = append(shape, out[d])
+		for i, st := range strides {
+			merged[i] = append(merged[i], st[d])
+		}
+	}
+	slices.Reverse(shape)
+	for _, m := range merged {
+		slices.Reverse(m)
+	}
+	return shape, merged
+}
+
+// newBcastParams fills the uniform for a merged walk, or reports that it
+// has more axes than the kernels take.
+func newBcastParams(count int, shape, strideA, strideB []int) (bcastParams, error) {
+	if len(shape) > maxBcastAxes {
+		return bcastParams{}, fmt.Errorf("tensai: gpu broadcast over %d axes, more than %d", len(shape), maxBcastAxes)
+	}
+	p := bcastParams{count: uint32(count), rank: uint32(len(shape))}
+	for i := range shape {
+		p.shape[i] = uint32(shape[i])
+		p.strideA[i] = uint32(strideA[i])
+		p.strideB[i] = uint32(strideB[i])
+	}
+	return p, nil
+}
+
+// Binary returns t op o element-wise, broadcasting the two the NumPy way:
+// the shapes line up at their trailing axes, and an axis of length 1 (or
+// one a shape lacks) stretches to the other's length. The result has the
+// broadcast shape. Equal shapes and o repeating as a trailing block -- a
+// bias row, a per-feature scale, a scalar -- run on a kernel that just
+// wraps o's index; every other broadcast, a (rows, 1) column or a
+// (batch, 1, 1, seq) mask, walks the axes.
 func (t *Tensor) Binary(op BinOp, o *Tensor) (*Tensor, error) {
 	if t.freed || o.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
@@ -4429,13 +4598,24 @@ func (t *Tensor) Binary(op BinOp, o *Tensor) (*Tensor, error) {
 	if t.g != o.g {
 		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
 	}
-	count := t.Size()
-	bCount, err := broadcastCount(count, o.Size())
+	outShape, err := dims.Broadcast(t.shape, o.shape)
 	if err != nil {
 		return nil, err
 	}
-	p := trainParams{count: uint32(count), aCount: uint32(count), bCount: bCount, mode: uint32(op)}
-	return t.g.trainOp(t.g.pipes.binOp, t.g.pipes.layBinOp, p, count, t.shape, t, o)
+	count := dims.Prod(outShape)
+	shape, st := mergeAxes(outShape, dims.BroadcastStrides(t.shape, outShape), dims.BroadcastStrides(o.shape, outShape))
+	sa, sb := st[0], st[1]
+	if !slices.Contains(sa, 0) && (len(shape) < 2 || len(shape) == 2 && sb[0] == 0 && sb[1] != 0) {
+		// t fills the output and o repeats in it.
+		p := trainParams{count: uint32(count), aCount: uint32(count), bCount: uint32(o.Size()), mode: uint32(op)}
+		return t.g.trainOp(t.g.pipes.binOp, t.g.pipes.layBinOp, p, count, outShape, t, o)
+	}
+	p, err := newBcastParams(count, shape, sa, sb)
+	if err != nil {
+		return nil, err
+	}
+	p.mode = uint32(op)
+	return t.g.bcastOp(t.g.pipes.binOpND, t.g.pipes.layBinOpND, p, count, outShape, t, o)
 }
 
 // Activate applies an activation element-wise.
@@ -4793,6 +4973,37 @@ func (t *Tensor) SumCols() (*Tensor, error) {
 	rows, cols := t.shape[0], t.shape[1]
 	p := trainParams{count: uint32(cols), aCount: uint32(rows * cols), bCount: uint32(cols), rows: uint32(rows)}
 	return t.g.trainOp(t.g.pipes.sumCols, t.g.pipes.laySumCols, p, cols, []int{1, cols}, t, nil)
+}
+
+// SumTo sums t down to shape, which must broadcast to t's shape: every
+// axis shape is stretched along to get there -- one it lacks, or one of
+// length 1 -- is summed over. It is the gradient an operand of Binary
+// collects, whichever axes it was broadcast along; SumCols is the case of
+// a block of rows.
+func (t *Tensor) SumTo(shape ...int) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if full, err := dims.Broadcast(shape, t.shape); err != nil || !dims.Same(full, t.shape) {
+		return nil, fmt.Errorf("tensai: cannot sum %v down to %v", t.shape, shape)
+	}
+	count := dims.Prod(shape)
+	merged, st := mergeAxes(t.shape, dims.BroadcastStrides(t.shape, t.shape), dims.BroadcastStrides(shape, t.shape))
+	src, dst := st[0], st[1]
+	outShape := append([]int(nil), shape...)
+	if len(merged) == 2 && dst[0] == 0 && dst[1] != 0 || len(merged) == 1 && dst[0] == 0 {
+		// A repeating block of rows, or everything into one element.
+		rows := merged[0]
+		cols := count
+		p := trainParams{count: uint32(cols), aCount: uint32(rows * cols), bCount: uint32(cols), rows: uint32(rows)}
+		return t.g.trainOp(t.g.pipes.sumCols, t.g.pipes.laySumCols, p, cols, outShape, t, nil)
+	}
+	p, err := newBcastParams(count, merged, src, dst)
+	if err != nil {
+		return nil, err
+	}
+	p.reps = uint32(t.Size() / count)
+	return t.g.bcastOp(t.g.pipes.sumBcast, t.g.pipes.laySumBcast, p, count, outShape, t, nil)
 }
 
 // AdamStep applies one Adam update to t in place, with the gradient in
