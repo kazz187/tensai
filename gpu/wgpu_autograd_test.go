@@ -148,6 +148,52 @@ func TestGPUResidentTraining(t *testing.T) {
 	}
 }
 
+// TestGPUResidentSGD trains the same MLP on the CPU and on a device tape
+// with SGD, which has no device kernel, so every update runs in host
+// memory. The next step's graph must read the updated weights: the device
+// copy used to stay as it was uploaded, and the network never trained.
+func TestGPUResidentSGD(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	train := func(dev *gpu.Device) (first, last tensai.Float, params []*autograd.Node) {
+		rng := rand.New(rand.NewPCG(109, 0))
+		x, y := randTensor(rng, 32, 16), randTensor(rng, 32, 4)
+		w1 := autograd.Param(randTensor(rng, 16, 24))
+		w2 := autograd.Param(randTensor(rng, 24, 4))
+		trainer := autograd.NewTrainer(optim.NewSGD(0.02, 0.9), w1, w2)
+		tape := autograd.NewTape()
+		if dev != nil {
+			tape.UseDevice(dev)
+		}
+		tape.Bind(w1, w2)
+		for i := 0; i < 40; i++ {
+			last = trainer.Step(autograd.Input(x).MatMul(w1).Tanh().MatMul(w2).MSELoss(y))
+			tape.Reset()
+			if i == 0 {
+				first = last
+			}
+		}
+		return first, last, []*autograd.Node{w1, w2}
+	}
+	cpuFirst, cpuLast, cpuP := train(nil)
+	_, devLast, devP := train(g)
+	if !(cpuLast < cpuFirst*0.5) {
+		t.Fatalf("training did not progress on the CPU: %g -> %g", cpuFirst, cpuLast)
+	}
+	if diff := math.Abs(float64(cpuLast - devLast)); diff > 1e-3*(1+math.Abs(float64(cpuLast))) {
+		t.Fatalf("loss after 40 steps: cpu=%g device=%g", cpuLast, devLast)
+	}
+	for i := range cpuP {
+		want, got := cpuP[i].Value(), devP[i].Value()
+		for j := range want.Data {
+			if diff := math.Abs(float64(want.Data[j] - got.Data[j])); diff > 1e-3*(1+math.Abs(float64(want.Data[j]))) {
+				t.Fatalf("param %d element %d: cpu=%v device=%v", i, j, want.Data[j], got.Data[j])
+			}
+		}
+	}
+}
+
 // TestGPUResidentStaysOnDevice checks that a resident graph really keeps
 // its intermediates on the GPU: nothing but the loss should have a host
 // copy after a step.

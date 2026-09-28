@@ -343,6 +343,11 @@ func (t *Trainer) Step(loss *Node) tensai.Float {
 		// Optimizers update flat parameter buffers, so any rank works as
 		// long as value and gradient agree.
 		t.ups[i].Step(flatMatrix(p.Value()), flatMatrix(p.Grad()), nil, nil)
+		// The new weights are in host memory. A copy on the device --
+		// there is one whenever a device graph used the parameter, and an
+		// optimizer without a device kernel sends every update here -- is
+		// stale, and the next graph would read it.
+		p.dropResident()
 	}
 	// The loss is read before the gradients are dropped, since reading it
 	// may be what brings the last device value home.
