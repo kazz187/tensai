@@ -479,6 +479,12 @@ func loadWGPU() error {
 // discrete one. Non-conformant Vulkan drivers (Mesa's dozen inside WSL2)
 // are allowed. The returned Device is safe for concurrent use.
 func Open(power ...Power) (*Device, error) {
+	return open(matmulWGSL, power...)
+}
+
+// open is Open with the main module's WGSL as an argument, so a test can
+// hand it one that does not compile and walk the error path.
+func open(src string, power ...Power) (*Device, error) {
 	if err := loadWGPU(); err != nil {
 		return nil, err
 	}
@@ -508,7 +514,7 @@ func Open(power ...Power) (*Device, error) {
 	})
 	runtime.KeepAlive(&opts)
 	if cbAdapter == 0 {
-		g.Close()
+		g.closeLocked()
 		return nil, fmt.Errorf("tensai: wgpu adapter request failed: %s", cbFailMsg)
 	}
 	g.adapter = cbAdapter
@@ -566,14 +572,14 @@ func Open(power ...Power) (*Device, error) {
 	runtime.KeepAlive(&lim)
 	runtime.KeepAlive(feats)
 	if cbDevice == 0 {
-		g.Close()
+		g.closeLocked()
 		return nil, fmt.Errorf("tensai: wgpu device request failed: %s", cbFailMsg)
 	}
 	g.device = cbDevice
 	g.queue = fnDeviceGetQueue(g.device)
 
 	uncapturedCB = ""
-	code, codeBuf := sv(matmulWGSL)
+	code, codeBuf := sv(src)
 	wgsl := wgpuShaderSourceWGSL{
 		chain: wgpuChainedStruct{sType: wgpuSTypeShaderSourceWGSL},
 		code:  code,
@@ -584,11 +590,11 @@ func Open(power ...Power) (*Device, error) {
 	runtime.KeepAlive(&smDesc)
 	runtime.KeepAlive(codeBuf)
 	if g.module == 0 || uncapturedCB != "" {
-		g.Close()
+		g.closeLocked()
 		return nil, fmt.Errorf("tensai: wgpu shader compilation failed: %s", uncapturedCB)
 	}
 	if err := g.initPipelines(); err != nil {
-		g.Close()
+		g.closeLocked()
 		return nil, err
 	}
 	return g, nil
@@ -649,6 +655,13 @@ func (g *Device) Name() string { return g.name }
 func (g *Device) Close() {
 	wgpuMu.Lock()
 	defer wgpuMu.Unlock()
+	g.closeLocked()
+}
+
+// closeLocked is Close for a caller that already holds wgpuMu -- Open,
+// backing out of a device it could not finish. wgpuMu is not reentrant,
+// so calling Close there would wait on the lock Open itself holds.
+func (g *Device) closeLocked() {
 	if g.closed {
 		return
 	}

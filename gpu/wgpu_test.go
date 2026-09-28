@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/internal/dims"
@@ -90,6 +91,52 @@ func TestGPUAdapterSelection(t *testing.T) {
 			t.Fatalf("element %d: got %v want %v", i, got.Data[i], v)
 		}
 	}
+}
+
+// TestGPUOpenFailureReturns makes Open fail after it has taken wgpuMu --
+// the module it compiles is not WGSL -- and checks that the failure comes
+// back as an error. Open used to back out through Close, which takes
+// wgpuMu again, so any failure past the lock waited on itself forever
+// instead of reporting. The Open after it must return too, which it cannot
+// while the lock is still held.
+func TestGPUOpenFailureReturns(t *testing.T) {
+	if err := loadWGPU(); err != nil {
+		t.Skipf("wgpu unavailable: %v", err)
+	}
+	openWithin := func(src string) (*Device, error) {
+		type result struct {
+			g   *Device
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			g, err := open(src)
+			done <- result{g, err}
+		}()
+		select {
+		case r := <-done:
+			return r.g, r.err
+		case <-time.After(time.Minute):
+			// wgpuMu is still held, and every later test in this binary
+			// would hang on it: stop here, with the stacks, instead.
+			panic("gpu: Open has not returned in a minute; it is waiting on wgpuMu")
+		}
+	}
+
+	g, err := openWithin("this is not WGSL")
+	if err == nil {
+		g.Close()
+		t.Fatal("Open succeeded with a module that does not compile")
+	}
+	t.Logf("broken module: %v", err)
+
+	// Whether this one succeeds depends on the machine; that it returns
+	// does not.
+	if g, err = openWithin(matmulWGSL); err != nil {
+		t.Logf("real module: %v", err)
+		return
+	}
+	g.Close()
 }
 
 func TestGPUTensorResident(t *testing.T) {
