@@ -7,13 +7,13 @@ GOEXPERIMENT=simd go build ./...
 GOEXPERIMENT=simd go test -bench=Dot .
 ```
 
-要件は amd64 + Go 1.26 または 1.27 (両世代の `simd` API にビルドタグで対応)、あるいは arm64 + Go 1.27 (`simd/archsimd` に arm64 が入った最初の版)。それ以外のビルド — 他アーキテクチャ、古い Go、`GOEXPERIMENT` 未設定 — は自動的にポータブル実装へフォールバックし、結果は同一です。カーネルごとの対応状況は [対応プラットフォーム](platforms.md) にあります。NEON 版はデコード経路をベクトル化していますが、4bit と grouped int8 の matvec、プレフィルのバッチ畳み込み、密行列積はまだです。
+要件は amd64 + Go 1.26 または 1.27 (両世代の `simd` API にビルドタグで対応)、あるいは arm64 + Go 1.27 (`simd/archsimd` に arm64 が入った最初の版)。それ以外のビルド — 他アーキテクチャ、古い Go、`GOEXPERIMENT` 未設定 — は自動的にポータブル実装へフォールバックし、結果は同一です。カーネルごとの対応状況は [対応プラットフォーム](platforms.md) にあります。
 
 ## ベクトル化の範囲
 
 AVX2 カーネルが今日適用されている場所と、まだ適用できる場所:
 
-- [x] Matmul (`Dot`/`DotInto`) — `Dense`、`Conv2D` (im2col 積)、`knn.Classifier` 距離、自動微分 `MatMul` が使用
+- [x] Matmul (`Dot`/`DotInto`) — `Dense`、`Conv2D` (im2col 積)、`knn.Classifier` 距離、自動微分 `MatMul` が使用。出力の 4 行 x 16 列を縮約の最後までレジスタに置くので、右オペランドの 1 行の読み込みが出力 4 行に効き、出力の書き込みは 1 回で済みます
 - [x] ReLU / LeakyReLU の順伝播と逆伝播
 - [x] Sigmoid / Tanh の順伝播と逆伝播 (ベクトル化した多項式 `exp`)
 - [x] GELU の順伝播と逆伝播 (ベクトル化した `erf`)
@@ -22,7 +22,7 @@ AVX2 カーネルが今日適用されている場所と、まだ適用できる
 - [x] Adam / AdamW のパラメータ更新
 - [x] SGD 更新 (モーメンタム形式、Adam と同じ融合積和ループ)
 - [x] スライスの加算/スケールプリミティブ (バイアス加算、`Embedding` 勾配の scatter-add)
-- [x] 転置不要の勾配 matmul (`DotTAInto`) — `Dense`/`Conv2D` の重み勾配は `input^T` / `im2col^T` を実体化しません
+- [x] 転置不要の勾配 matmul (`DotTAInto`、`DotTBInto`) — `Dense`/`Conv2D` の重み勾配は `input^T` / `im2col^T` を実体化しません。NEON では重み勾配も同じ 4x16 タイルで、入力勾配は入力 4 行 x 重み 4 行ずつまとめて計算します
 - [x] 残りの転置 (`T`/`TInto`) — キャッシュブロッキングされた 32x32 タイル
 - [x] Softmax 逆伝播の行内積 (自動微分) — 融合 AVX2 内積とヤコビアン・ベクトル累積
 - [ ] MSE / BinaryCrossEntropy 損失 (BCE はベクトル化 `log` が必要)
@@ -32,6 +32,14 @@ AVX2 カーネルが今日適用されている場所と、まだ適用できる
 - [ ] im2col / col2im の gather-scatter (連続区間はバルクコピーにできる)
 
 未チェックの項目はおおよそ期待効果順ですが、どれも今の学習プロファイルでは目立ちません。
+
+タイル化しても、有限の結果は 1 行ずつのカーネルとビット単位で同じです (ゼロの符号だけは異なりえます)。各出力要素は今も同じ融合積和で同じ順に足し合わされ、隣の要素と並行して計算されるようになっただけだからです。変わるのは速度だけです。Apple M5 の 1 コア (`go test -bench GEMM -cpu 1`、幅 128 のトークン 8192 個を 128 と 512 へ、およびその逆):
+
+| 積 | 1 行ずつのカーネル | タイル |
+|---|---|---|
+| `x * w` (`DotInto`) | 13 GFLOP/s | 79–84 GFLOP/s |
+| `x^T * g` (`DotTAInto`) | 13 GFLOP/s | 72–78 GFLOP/s |
+| `g * w^T` (`DotTBInto`) | 33–36 GFLOP/s | 58–79 GFLOP/s |
 
 int8/int4 量子化 matmul は 256 ビットの u8 x s8 ペア積和に基づく独自の AVX2 パスを持ちます — [量子化](quantization.md)参照。
 

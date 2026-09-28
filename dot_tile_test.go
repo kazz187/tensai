@@ -1,4 +1,4 @@
-//go:build goexperiment.simd && amd64
+//go:build goexperiment.simd && (amd64 || (arm64 && go1.27))
 
 package tensai
 
@@ -11,11 +11,14 @@ import (
 
 // The tiled kernel accumulates in the same order as the row kernel, so on
 // finite inputs the two agree to the bit, including the column and row
-// tails the tiles leave to the row kernel and inputs with zeros in a.
+// tails the tiles leave to the row kernel and inputs with zeros in a. The
+// depths straddle both builds' dotTileK, so a tile also picks up a
+// partial sum from the output.
 func TestDotRowsTiledMatchesAxpy(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	for _, sh := range [][3]int{
 		{4, 16, 16}, {7, 33, 17}, {12, 300, 48}, {9, 600, 70}, {32, 1, 64}, {5, 257, 31}, {64, 512, 144},
+		{8, 1100, 32}, {13, 513, 50},
 	} {
 		m, k, n := sh[0], sh[1], sh[2]
 		a, b := NewMatrix(m, k), NewMatrix(k, n)

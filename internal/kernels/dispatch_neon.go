@@ -762,9 +762,66 @@ func WriteRead(row, delta []float32, k, q float32, out []float32) {
 	}
 }
 
-// DotVecs4 is DotVecs for four vectors at once.
+// DotVecs4 is DotVecs for four vectors at once: outs[j][i] = qs row i .
+// ks[j], every result bit for bit what DotVecs(qs, ks[j], outs[j]) gives.
+// The rows of qs go four at a time against all four ks, sixteen
+// accumulators in all, so eight loads feed sixteen FMAs where the
+// one-key kernel spends five on four -- the input gradient of a product,
+// a * w^T, is exactly this shape. Each dot keeps DotVec's one accumulator,
+// walked in the same order and reduced the same way, so only the grouping
+// changes; the rows short of a four go through DotVecs itself.
 func DotVecs4(qs []float32, ks, outs [4][]float32) {
+	d, n := len(ks[0]), len(outs[0])
+	i := 0
+	if d >= 8 {
+		for ; i+4 <= n; i += 4 {
+			dotVecs4x4(qs[i*d:(i+4)*d], ks, outs, i)
+		}
+	}
 	for j := range ks {
-		DotVecs(qs, ks[j], outs[j])
+		DotVecs(qs[i*d:], ks[j], outs[j][i:])
+	}
+}
+
+// dotVecs4x4 writes the sixteen dots of qs's four rows with the four ks
+// into outs[j][i..i+4].
+func dotVecs4x4(qs []float32, ks, outs [4][]float32, i int) {
+	d := len(ks[0])
+	q0, q1, q2, q3 := qs[:d:d], qs[d:2*d:2*d], qs[2*d:3*d:3*d], qs[3*d:4*d:4*d]
+	k0, k1, k2, k3 := ks[0][:d:d], ks[1][:d:d], ks[2][:d:d], ks[3][:d:d]
+	n := d &^ 3
+	// a<j><t> is key j against row t.
+	var a00, a01, a02, a03, a10, a11, a12, a13 archsimd.Float32x4
+	var a20, a21, a22, a23, a30, a31, a32, a33 archsimd.Float32x4
+	for x := 0; x < n; x += 4 {
+		kv0, kv1 := simd.LoadF32x4(k0[x:]), simd.LoadF32x4(k1[x:])
+		kv2, kv3 := simd.LoadF32x4(k2[x:]), simd.LoadF32x4(k3[x:])
+		qv := simd.LoadF32x4(q0[x:])
+		a00, a10, a20, a30 = qv.MulAdd(kv0, a00), qv.MulAdd(kv1, a10), qv.MulAdd(kv2, a20), qv.MulAdd(kv3, a30)
+		qv = simd.LoadF32x4(q1[x:])
+		a01, a11, a21, a31 = qv.MulAdd(kv0, a01), qv.MulAdd(kv1, a11), qv.MulAdd(kv2, a21), qv.MulAdd(kv3, a31)
+		qv = simd.LoadF32x4(q2[x:])
+		a02, a12, a22, a32 = qv.MulAdd(kv0, a02), qv.MulAdd(kv1, a12), qv.MulAdd(kv2, a22), qv.MulAdd(kv3, a32)
+		qv = simd.LoadF32x4(q3[x:])
+		a03, a13, a23, a33 = qv.MulAdd(kv0, a03), qv.MulAdd(kv1, a13), qv.MulAdd(kv2, a23), qv.MulAdd(kv3, a33)
+	}
+	// Stored before any is summed, as dotVecs4 does, so the sixteen
+	// horizontal sums do not chain through one buffer.
+	var buf [16][4]float32
+	for x, v := range [16]archsimd.Float32x4{
+		a00, a01, a02, a03, a10, a11, a12, a13,
+		a20, a21, a22, a23, a30, a31, a32, a33,
+	} {
+		simd.StoreF32x4(v, buf[x][:])
+	}
+	for j, k := range [4][]float32{k0, k1, k2, k3} {
+		for t, q := range [4][]float32{q0, q1, q2, q3} {
+			b := &buf[4*j+t]
+			s := b[0] + b[1] + b[2] + b[3]
+			for x := n; x < d; x++ {
+				s += q[x] * k[x]
+			}
+			outs[j][i+t] = s
+		}
 	}
 }
