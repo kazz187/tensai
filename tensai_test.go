@@ -74,6 +74,59 @@ func TestDotTAInto(t *testing.T) {
 	}
 }
 
+// TestGEMMModes checks the three products against a float64 reference on
+// every build -- portable, AVX2, NEON -- over shapes that reach each
+// kernel's register tiles and the tails beside them: rows short of a
+// tile, columns short of 16, a contraction deeper than a tile pass, and
+// products big enough to be split across workers.
+func TestGEMMModes(t *testing.T) {
+	rng := rand.New(rand.NewPCG(97, 0))
+	for _, sh := range [][3]int{
+		{1, 5, 3}, {4, 16, 16}, {7, 33, 17}, {9, 1, 33}, {13, 513, 50},
+		{64, 1100, 40}, {130, 70, 190}, {256, 128, 128},
+	} {
+		m, k, n := sh[0], sh[1], sh[2]
+		a, b := RandomMatrix(m, k, rng), RandomMatrix(k, n, rng)
+		for i := 0; i < len(a.Data); i += 5 {
+			a.Data[i] = 0
+		}
+		want := make([]float64, m*n)
+		bound := make([]float64, m*n) // sum of |a||b|, what rounding scales with
+		for i := 0; i < m; i++ {
+			for j := 0; j < n; j++ {
+				for p := 0; p < k; p++ {
+					x, y := float64(a.Data[i*k+p]), float64(b.Data[p*n+j])
+					want[i*n+j] += x * y
+					bound[i*n+j] += math.Abs(x * y)
+				}
+			}
+		}
+		check := func(mode string, got *Matrix) {
+			t.Helper()
+			for i, w := range want {
+				if diff := math.Abs(float64(got.Data[i]) - w); diff > 1e-5*bound[i]+1e-6 {
+					t.Fatalf("%s %dx%dx%d: element %d = %v, want %v", mode, m, k, n, i, got.Data[i], w)
+				}
+			}
+		}
+		nn := NewMatrix(m, n)
+		if err := DotInto(nn, a, b); err != nil {
+			t.Fatal(err)
+		}
+		check("NN", nn)
+		tn := NewMatrix(m, n)
+		if err := DotTAInto(tn, a.T(), b); err != nil {
+			t.Fatal(err)
+		}
+		check("TN", tn)
+		nt := NewMatrix(m, n)
+		if err := DotTBInto(nt, a, b.T()); err != nil {
+			t.Fatal(err)
+		}
+		check("NT", nt)
+	}
+}
+
 func TestDotVecAxpy(t *testing.T) {
 	rng := rand.New(rand.NewPCG(81, 0))
 	for _, n := range []int{0, 1, 7, 8, 15, 16, 64, 127, 1000} {

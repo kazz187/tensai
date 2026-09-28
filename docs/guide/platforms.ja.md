@@ -44,7 +44,7 @@ Linux でも macOS でも Windows でも同じ NEON カーネルが使われま�
 |---|---|---|
 | linux/amd64 | AVX2 | 済。開発と計測はここで行っています |
 | linux/arm64 | NEON | 済。エミュレータ上でテストと生成を確認 |
-| darwin/arm64 | NEON | CI の Apple Silicon でテスト済。計測は未 |
+| darwin/arm64 | NEON | CI の Apple Silicon でテスト済。密な浮動小数点行列積は M5 での計測を [SIMD](simd.md) に記載 |
 | windows/amd64 | AVX2 | 済 |
 | windows/arm64 | NEON | 未 |
 

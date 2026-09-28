@@ -47,7 +47,7 @@ build system selects, and worth keeping separate:
 |---|---|---|
 | linux/amd64 | AVX2 | Yes, this is where the kernels are developed and benchmarked |
 | linux/arm64 | NEON | Yes, tests and a generation run under emulation |
-| darwin/arm64 | NEON | Tests pass on Apple Silicon in CI; no measurement yet |
+| darwin/arm64 | NEON | Tests pass on Apple Silicon in CI; the dense float matmul is measured on an M5 in [SIMD](simd.md) |
 | windows/amd64 | AVX2 | Yes |
 | windows/arm64 | NEON | Not yet |
 
