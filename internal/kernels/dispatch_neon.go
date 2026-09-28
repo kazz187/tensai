@@ -769,19 +769,30 @@ func WriteRead(row, delta []float32, k, q float32, out []float32) {
 // one-key kernel spends five on four -- the input gradient of a product,
 // a * w^T, is exactly this shape. Each dot keeps DotVec's one accumulator,
 // walked in the same order and reduced the same way, so only the grouping
-// changes; the rows short of a four go through DotVecs itself.
+// changes; the rows short of a four go through DotVecs itself. Below
+// dotVecs4x4Min elements the sixteen reductions cost more than sharing the
+// loads saves, and DotVecs takes it all.
 func DotVecs4(qs []float32, ks, outs [4][]float32) {
 	d, n := len(ks[0]), len(outs[0])
 	i := 0
-	if d >= 8 {
+	if d >= dotVecs4x4Min {
 		for ; i+4 <= n; i += 4 {
 			dotVecs4x4(qs[i*d:(i+4)*d], ks, outs, i)
+		}
+		if i == n {
+			return // no rows left: skip four calls that would find none
 		}
 	}
 	for j := range ks {
 		DotVecs(qs[i*d:], ks[j], outs[j][i:])
 	}
 }
+
+// dotVecs4x4Min is the shortest vector DotVecs4 takes four rows at a
+// time. On an M5, over 4 to 64 rows, the tile ran 3-8% slower than
+// DotVecs at 8 elements, about even at 9 and 10, 4-9% faster at 12 and
+// more from there.
+const dotVecs4x4Min = 12
 
 // dotVecs4x4 writes the sixteen dots of qs's four rows with the four ks
 // into outs[j][i..i+4].
@@ -814,14 +825,27 @@ func dotVecs4x4(qs []float32, ks, outs [4][]float32, i int) {
 	} {
 		simd.StoreF32x4(v, buf[x][:])
 	}
-	for j, k := range [4][]float32{k0, k1, k2, k3} {
-		for t, q := range [4][]float32{q0, q1, q2, q3} {
-			b := &buf[4*j+t]
-			s := b[0] + b[1] + b[2] + b[3]
-			for x := n; x < d; x++ {
-				s += q[x] * k[x]
-			}
-			outs[j][i+t] = s
-		}
+	var s [16]float32
+	for x := range s {
+		b := &buf[x]
+		s[x] = b[0] + b[1] + b[2] + b[3]
 	}
+	// The elements past the last four are added one at a time with a fused
+	// multiply-add each, as DotVec adds them, but four dots to a vector --
+	// r<j> is key j against the four rows -- so the sixteen chains run side
+	// by side. One after another, a tail of three left a tile of 35 a
+	// quarter slower than DotVecs.
+	r0, r1, r2, r3 := simd.LoadF32x4(s[0:]), simd.LoadF32x4(s[4:]), simd.LoadF32x4(s[8:]), simd.LoadF32x4(s[12:])
+	for x := n; x < d; x++ {
+		col := [4]float32{q0[x], q1[x], q2[x], q3[x]}
+		qv := simd.LoadF32x4(col[:])
+		r0 = qv.MulAdd(archsimd.BroadcastFloat32x4(k0[x]), r0)
+		r1 = qv.MulAdd(archsimd.BroadcastFloat32x4(k1[x]), r1)
+		r2 = qv.MulAdd(archsimd.BroadcastFloat32x4(k2[x]), r2)
+		r3 = qv.MulAdd(archsimd.BroadcastFloat32x4(k3[x]), r3)
+	}
+	simd.StoreF32x4(r0, outs[0][i:i+4])
+	simd.StoreF32x4(r1, outs[1][i:i+4])
+	simd.StoreF32x4(r2, outs[2][i:i+4])
+	simd.StoreF32x4(r3, outs[3][i:i+4])
 }

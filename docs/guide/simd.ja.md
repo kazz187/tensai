@@ -39,7 +39,9 @@ AVX2 カーネルが今日適用されている場所と、まだ適用できる
 |---|---|---|
 | `x * w` (`DotInto`) | 13 GFLOP/s | 79–84 GFLOP/s |
 | `x^T * g` (`DotTAInto`) | 13 GFLOP/s | 72–78 GFLOP/s |
-| `g * w^T` (`DotTBInto`) | 33–36 GFLOP/s | 58–79 GFLOP/s |
+| `g * w^T` (`DotTBInto`) | 33–36 GFLOP/s | 68–86 GFLOP/s |
+
+タイルには小さすぎる形 — 4 行未満の積、1 サンプル分の重み勾配、縮約が 12 要素未満の入力勾配 — は、1 行ずつのカーネルで計算します。
 
 int8/int4 量子化 matmul は 256 ビットの u8 x s8 ペア積和に基づく独自の AVX2 パスを持ちます — [量子化](quantization.md)参照。
 
