@@ -179,6 +179,42 @@ func TestGEMMEmptyOutput(t *testing.T) {
 	}
 }
 
+// TestDotTAIntoTallOverwrites checks the tall, narrow x^T*g path (a.Rows >=
+// 512 with a result small enough for the register kernel) overwrites its
+// output: the portable kernel accumulates, so a stale output -- a tape
+// buffer reused from the step before, or the same product run twice --
+// used to be added into the gradient.
+func TestDotTAIntoTallOverwrites(t *testing.T) {
+	rng := rand.New(rand.NewPCG(83, 0))
+	nan := Float(math.NaN())
+	for _, sh := range [][3]int{{600, 8, 8}, {512, 9, 4}, {1024, 16, 16}, {513, 3, 5}} {
+		r, i, j := sh[0], sh[1], sh[2]
+		a := RandomMatrix(r, i, rng)
+		b := RandomMatrix(r, j, rng)
+		out := NewMatrix(i, j)
+		for k := range out.Data {
+			out.Data[k] = nan
+		}
+		for run := 0; run < 2; run++ {
+			if err := DotTAInto(out, a, b); err != nil {
+				t.Fatal(err)
+			}
+			for p := 0; p < i; p++ {
+				for q := 0; q < j; q++ {
+					var want float64
+					for s := 0; s < r; s++ {
+						want += float64(a.Data[s*i+p]) * float64(b.Data[s*j+q])
+					}
+					got := float64(out.Data[p*j+q])
+					if math.IsNaN(got) || math.Abs(got-want) > 1e-3*(1+math.Abs(want)) {
+						t.Fatalf("%dx%d^T*%dx%d run %d: out[%d,%d] = %v, want %v", r, i, r, j, run, p, q, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
 func TestDotVecAxpy(t *testing.T) {
 	rng := rand.New(rand.NewPCG(81, 0))
 	for _, n := range []int{0, 1, 7, 8, 15, 16, 64, 127, 1000} {

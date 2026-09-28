@@ -199,6 +199,8 @@ func dotWorkerCount(rows, inner, cols int) int {
 // contracted axis is every pixel of every image in the batch.
 func dotTATall(out, a, b *Matrix, lo, hi int) {
 	if !simd.HasAVX2 {
+		// The fallback accumulates (see dot_generic.go's dotTATall).
+		clear(out.Data[lo*b.Cols : hi*b.Cols])
 		dotTARowsGeneric(out, a, b, lo, hi)
 		return
 	}
