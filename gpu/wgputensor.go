@@ -14,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"unsafe"
 
 	"github.com/mattn/tensai"
@@ -1853,6 +1855,19 @@ fn adam_step(@builtin(workgroup_id) wg: vec3<u32>,
     tout[idx] = w - tp.lr * (m * tp.rc1 / (sqrt(v * tp.rc2) + tp.eps) + tp.decay * w);
 }
 
+// fill_zero clears a buffer taken back from the pool, which holds whatever
+// its last tensor left: a fresh one from the driver starts zeroed, and
+// NewZeroTensor only runs this when it reuses one.
+@compute @workgroup_size(256, 1, 1)
+fn fill_zero(@builtin(workgroup_id) wg: vec3<u32>,
+             @builtin(num_workgroups) nwg: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < tp.count) {
+        tout[idx] = 0.0;
+    }
+}
+
 @group(0) @binding(52) var<storage, read> tc: array<f32>;
 @group(0) @binding(53) var<uniform> pmp: PermuteParams;
 
@@ -2964,6 +2979,7 @@ type gpuPipelines struct {
 	binOp, actFwd, actBwd, sumCols, adamStep       uintptr
 	layBinOp, layActFwd, layActBwd                 uintptr
 	binOpND, sumBcast, layBinOpND, laySumBcast     uintptr
+	fillZero, layFillZero                          uintptr
 	laySumCols, layAdamStep                        uintptr
 	matmulL, matmulLT, matmulLTN                   uintptr
 	matmulV4, matmulV4T, matmulV4TN                uintptr
@@ -3034,6 +3050,7 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.binOp, &g.pipes.layBinOp, "bin_op"},
 		{&g.pipes.binOpND, &g.pipes.layBinOpND, "bin_op_nd"},
 		{&g.pipes.sumBcast, &g.pipes.laySumBcast, "sum_bcast"},
+		{&g.pipes.fillZero, &g.pipes.layFillZero, "fill_zero"},
 		{&g.pipes.actFwd, &g.pipes.layActFwd, "act_fwd"},
 		{&g.pipes.actBwd, &g.pipes.layActBwd, "act_bwd"},
 		{&g.pipes.sumCols, &g.pipes.laySumCols, "sum_cols"},
@@ -3347,6 +3364,7 @@ type gpuBufferPool struct {
 	batch   map[[2]uint64][]uintptr
 	pending []pooledBuf
 	bytes   uint64
+	max     uint64 // cap on bytes; see poolLimit
 }
 
 type pooledBuf struct {
@@ -3354,8 +3372,45 @@ type pooledBuf struct {
 	buf         uintptr
 }
 
-// gpuPoolMaxBytes caps the pooled total; beyond it buffers just release.
+// gpuPoolMaxBytes is the default cap on the pooled total; beyond it
+// buffers just release. It covers a decode step many times over, but not
+// a training step: every buffer a step made comes back at tape.Reset, and
+// past the cap each release also drops the whole bind-group cache, so the
+// next step allocates and binds everything afresh. TENSAI_GPU_POOL_MB
+// raises it (see poolLimit).
 const gpuPoolMaxBytes = 512 << 20
+
+// poolLimit returns the pool cap Open gives a device: TENSAI_GPU_POOL_MB
+// mebibytes when the variable is set, gpuPoolMaxBytes otherwise. 0 turns
+// pooling off.
+func poolLimit() (uint64, error) {
+	v := os.Getenv("TENSAI_GPU_POOL_MB")
+	if v == "" {
+		return gpuPoolMaxBytes, nil
+	}
+	mb, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("tensai: TENSAI_GPU_POOL_MB=%q is not a size in MiB", v)
+	}
+	return mb << 20, nil
+}
+
+// takePooled returns a pooled tensor buffer of exactly size bytes that a
+// dispatch may write -- one freed earlier in the open batch included, as
+// takeOutBuffer explains -- or 0 when the pool has none. The caller holds
+// g.mu and wgpuMu.
+func (g *Device) takePooled(size uint64) uintptr {
+	key := [2]uint64{gpuTensorUsage, size}
+	for _, m := range []map[[2]uint64][]uintptr{g.pool.batch, g.pool.free} {
+		if l := m[key]; len(l) > 0 {
+			buf := l[len(l)-1]
+			m[key] = l[:len(l)-1]
+			g.pool.bytes -= size
+			return buf
+		}
+	}
+	return 0
+}
 
 // takeBuffer returns a pooled buffer of exactly this usage and size, or a
 // fresh one. The caller holds g.mu and wgpuMu.
@@ -3373,7 +3428,7 @@ func (g *Device) takeBuffer(usage, size uint64) uintptr {
 // putBuffer returns a buffer to the pool (or releases it past the cap).
 // The caller holds wgpuMu.
 func (g *Device) putBuffer(usage, size uint64, buf uintptr) {
-	if g.closed || g.pool.bytes+size > gpuPoolMaxBytes {
+	if g.closed || g.pool.bytes+size > g.pool.max {
 		g.dropBuffer(buf)
 		return
 	}
@@ -3425,7 +3480,7 @@ func (g *Device) drainPending() {
 		delete(g.pool.batch, key)
 	}
 	for _, p := range g.pool.pending {
-		if g.pool.bytes+p.size > gpuPoolMaxBytes {
+		if g.pool.bytes+p.size > g.pool.max {
 			g.dropBuffer(p.buf)
 			continue
 		}
@@ -3455,7 +3510,7 @@ func (g *Device) releasePool() {
 	for _, p := range g.pool.pending {
 		fnBufferRelease(p.buf)
 	}
-	g.pool = gpuBufferPool{}
+	g.pool = gpuBufferPool{max: g.pool.max}
 	g.invalidateBindGroups()
 }
 
@@ -3658,7 +3713,11 @@ func (g *Device) HasF16() bool { return g.hasF16 }
 // NewZeroTensor allocates a float32 tensor on the device without
 // sending anything: a buffer starts zeroed, so a KV cache -- which is
 // gigabytes of it, and every row written before it is read -- has no
-// reason to be uploaded from the host at all.
+// reason to be uploaded from the host at all. A pooled buffer of the same
+// size is reused when there is one, cleared by a kernel instead; a
+// training step asks for a zero gradient per node, and allocating those
+// fresh every step would leave the ones the last step freed to pile up in
+// the pool.
 func (g *Device) NewZeroTensor(shape ...int) (*Tensor, error) {
 	n := 1
 	for _, d := range shape {
@@ -3675,11 +3734,41 @@ func (g *Device) NewZeroTensor(shape ...int) (*Tensor, error) {
 		return nil, errors.New("tensai: gpu is closed")
 	}
 	t := &Tensor{g: g, shape: append([]int(nil), shape...)}
-	t.buf = g.newBuffer(gpuTensorUsage, t.byteLen())
+	bytes := t.byteLen()
+	if err := g.checkSize(bytes); err != nil {
+		return nil, err
+	}
+	if t.buf = g.takePooled(bytes); t.buf != 0 {
+		if err := g.fillZero(t.buf, n); err != nil {
+			g.dropBuffer(t.buf)
+			return nil, err
+		}
+		return t, nil
+	}
+	t.buf = g.newBuffer(gpuTensorUsage, bytes)
 	if t.buf == 0 {
 		return nil, errors.New("tensai: gpu buffer allocation failed")
 	}
 	return t, nil
+}
+
+// fillZero clears the first n floats of buf with a dispatch, which inside
+// a batch is ordered after every earlier use of a buffer the batch freed.
+// The caller holds g.mu and wgpuMu.
+func (g *Device) fillZero(buf uintptr, n int) error {
+	uncapturedCB = ""
+	p := trainParams{count: uint32(n)}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&p), trainParamBytes)
+	entries := [2]wgpuBindGroupEntry{
+		{binding: 46, buffer: bufParams, size: trainParamBytes},
+		{binding: 49, buffer: buf, size: uint64(n) * 4},
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.layFillZero, entries[:])
+	runtime.KeepAlive(&entries)
+	x, y := split2D((n + 255) / 256)
+	return g.dispatch(g.pipes.fillZero, bindGroup, x, y, 1)
 }
 
 func (g *Device) NewF16Tensor(shape ...int) (*Tensor, error) {

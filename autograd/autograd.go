@@ -364,12 +364,11 @@ func (t *Trainer) deviceStep(i int, p *Node) bool {
 	}
 	st := &t.devState[i]
 	if st.m == nil {
-		zero := tensai.NewTensor(p.Shape()...)
-		m, err := d.Upload(zero)
+		m, err := d.NewZeroTensor(p.Shape()...)
 		if err != nil {
 			return false
 		}
-		v, err := d.Upload(zero)
+		v, err := d.NewZeroTensor(p.Shape()...)
 		if err != nil {
 			m.Free()
 			return false

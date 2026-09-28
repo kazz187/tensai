@@ -621,6 +621,109 @@ func TestGPUPermute(t *testing.T) {
 	}
 }
 
+// TestGPUNewZeroTensorReuse frees tensors full of values and asks for zero
+// ones of the same size, which come back out of the pool instead of from
+// the driver and so hold the old values until the clearing kernel runs:
+// they must read back as zeros, with a batch open as well -- where the
+// buffer a dispatch just wrote is handed straight back -- as without.
+func TestGPUNewZeroTensorReuse(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewPCG(71, 0))
+	zeros := make([]tensai.Float, 37*29)
+
+	x, err := g.Upload(randTensor(rng, 37, 29))
+	if err != nil {
+		t.Fatal(err)
+	}
+	freed := x.buf
+	x.Free()
+	z, err := g.NewZeroTensor(37, 29)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if z.buf != freed {
+		t.Fatal("the zero tensor did not reuse the freed buffer")
+	}
+	got, err := z.Download()
+	z.Free()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkClose(t, "reused", got, zeros, 0)
+
+	if err := g.BeginBatch(); err != nil {
+		t.Fatal(err)
+	}
+	x, err = g.Upload(randTensor(rng, 37, 29))
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := x.Binary(OpAdd, x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := y.buf
+	y.Free()
+	z, err = g.NewZeroTensor(37, 29)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if z.buf != written {
+		t.Fatal("the zero tensor did not reuse the buffer the batch just wrote")
+	}
+	if err := g.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	got, err = z.Download()
+	x.Free()
+	z.Free()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkClose(t, "reused in a batch", got, zeros, 0)
+}
+
+// TestGPUPoolLimit checks that TENSAI_GPU_POOL_MB sets the pool's cap, that
+// 0 keeps nothing, and that a value that is not a size stops Open rather
+// than being ignored.
+func TestGPUPoolLimit(t *testing.T) {
+	for _, c := range []struct {
+		env  string
+		want uint64
+		ok   bool
+	}{
+		{"", gpuPoolMaxBytes, true},
+		{"8192", 8192 << 20, true},
+		{"0", 0, true},
+		{"2GiB", 0, false},
+		{"-1", 0, false},
+	} {
+		t.Setenv("TENSAI_GPU_POOL_MB", c.env)
+		got, err := poolLimit()
+		if (err == nil) != c.ok || got != c.want {
+			t.Errorf("TENSAI_GPU_POOL_MB=%q: got %d, %v; want %d, ok=%v", c.env, got, err, c.want, c.ok)
+		}
+	}
+
+	t.Setenv("TENSAI_GPU_POOL_MB", "0")
+	g := openTestGPU(t)
+	defer g.Close()
+	x, err := g.Upload(tensai.NewTensor(64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.Free()
+	if g.pool.bytes != 0 {
+		t.Fatalf("a pool capped at 0 kept %d bytes", g.pool.bytes)
+	}
+	t.Setenv("TENSAI_GPU_POOL_MB", "lots")
+	if d, err := Open(); err == nil {
+		d.Close()
+		t.Fatal("Open accepted TENSAI_GPU_POOL_MB=lots")
+	}
+}
+
 // TestGPUEmbed checks the lookup and its scatter-add, with an index that
 // repeats so the atomic path is exercised -- and the same scatter through
 // the kernel a backend without those atomics runs instead.

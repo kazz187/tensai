@@ -488,10 +488,14 @@ func open(src string, power ...Power) (*Device, error) {
 	if err := loadWGPU(); err != nil {
 		return nil, err
 	}
+	poolMax, err := poolLimit()
+	if err != nil {
+		return nil, err
+	}
 	wgpuMu.Lock()
 	defer wgpuMu.Unlock()
 
-	g := &Device{}
+	g := &Device{pool: gpuBufferPool{max: poolMax}}
 	extras := wgpuInstanceExtras{
 		chain: wgpuChainedStruct{sType: wgpuSTypeInstanceExtras},
 		flags: wgpuInstanceFlagAllowNoncompliant,

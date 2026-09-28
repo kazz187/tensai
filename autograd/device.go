@@ -124,7 +124,9 @@ func (n *Node) resident(tp *Tape) (*gpu.Tensor, bool) {
 }
 
 // residentGrad returns the node's gradient buffer on the device, allocating
-// a zero one the first time.
+// a zero one the first time. The zeros are made on the device: every node
+// of a step asks for one, and building each on the host to send it over
+// cost an allocation and a full-size upload apiece.
 func (n *Node) residentGrad() (*gpu.Tensor, bool) {
 	if n.devGrad != nil {
 		return n.devGrad, true
@@ -133,11 +135,13 @@ func (n *Node) residentGrad() (*gpu.Tensor, bool) {
 	if d == nil {
 		return nil, false
 	}
-	src := n.grad
-	if src == nil {
-		src = tensai.NewTensor(n.Shape()...)
+	var g *gpu.Tensor
+	var err error
+	if n.grad != nil {
+		g, err = d.Upload(n.grad)
+	} else {
+		g, err = d.NewZeroTensor(n.Shape()...)
 	}
-	g, err := d.Upload(src)
 	if err != nil {
 		return nil, false
 	}
