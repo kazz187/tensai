@@ -35,9 +35,10 @@ type Tape struct {
 	free map[int][][]tensai.Float
 	used [][]tensai.Float
 
-	dev     *gpu.Device   // set by UseDevice; see device.go
-	devUsed []*gpu.Tensor // device buffers this step allocated
-	batch   bool          // a command batch is open on the device
+	dev      *gpu.Device   // set by UseDevice; see device.go
+	devUsed  []*gpu.Tensor // device buffers this step allocated
+	uploaded []*Node       // nodes whose host value this step uploaded
+	batch    bool          // a command batch is open on the device
 }
 
 // NewTape returns an empty tape.

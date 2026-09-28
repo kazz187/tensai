@@ -194,6 +194,44 @@ func TestGPUResidentSGD(t *testing.T) {
 	}
 }
 
+// TestGPUResidentInputReuse feeds one Input node to several steps of a
+// device tape, refilling its data in between, the way a fixed batch or a
+// buffer loaded in place is fed. Reset frees the copy the node uploaded;
+// the next step must upload it again -- and so see the new data -- rather
+// than hand the kernels the freed buffer and quietly run on the CPU.
+func TestGPUResidentInputReuse(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	rng := rand.New(rand.NewPCG(107, 0))
+	x := randTensor(rng, 8, 16)
+	w := autograd.Param(randTensor(rng, 16, 4))
+	tape := autograd.NewTape()
+	tape.UseDevice(g)
+	tape.Bind(w)
+	in := autograd.Input(x)
+	for step := 0; step < 3; step++ {
+		y := in.MatMul(w)
+		if !y.Resident() {
+			t.Fatalf("step %d: the product left the device", step)
+		}
+		want, err := tensai.MatMul(x, w.Value())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := y.Value()
+		for i := range want.Data {
+			if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4*(1+math.Abs(float64(want.Data[i]))) {
+				t.Fatalf("step %d element %d: device=%v cpu=%v", step, i, got.Data[i], want.Data[i])
+			}
+		}
+		tape.Reset()
+		for i := range x.Data {
+			x.Data[i] = tensai.Float(rng.NormFloat64())
+		}
+	}
+}
+
 // TestGPUResidentStaysOnDevice checks that a resident graph really keeps
 // its intermediates on the GPU: nothing but the loss should have a host
 // copy after a step.
