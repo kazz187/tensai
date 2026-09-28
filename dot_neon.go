@@ -22,6 +22,13 @@ import (
 // dotRows computes rows lo..hi of out = a * b.
 func dotRows(out, a, b *Matrix, lo, hi int) {
 	cols := b.Cols
+	if a.Cols == 0 {
+		// An empty contraction sums nothing. The tiles' loop over it would
+		// not run and leave whatever out held, so the rows are cleared
+		// here, as the row kernel clears a row with no nonzero element.
+		clear(out.Data[lo*cols : hi*cols])
+		return
+	}
 	if hi-lo >= 4 && cols >= 16 {
 		r4 := lo + (hi-lo)&^3
 		n16 := cols &^ 15
