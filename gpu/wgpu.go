@@ -404,6 +404,12 @@ func loadWGPU() error {
 // choice: LowPower prefers the integrated Device, HighPerformance the
 // discrete one. The returned Device is safe for concurrent use.
 func Open(power ...Power) (*Device, error) {
+	return open(matmulWGSL, power...)
+}
+
+// open is Open with the main module's WGSL as an argument, so a test can
+// hand it one that does not compile and walk the error path.
+func open(src string, power ...Power) (*Device, error) {
 	if err := loadWGPU(); err != nil {
 		return nil, err
 	}
@@ -424,7 +430,7 @@ func Open(power ...Power) (*Device, error) {
 	fnInstanceRequestAdapter(g.instance, unsafe.Pointer(&opts), adapterCB, nil)
 	runtime.KeepAlive(&opts)
 	if cbAdapter == 0 {
-		g.Close()
+		g.closeLocked()
 		return nil, fmt.Errorf("tensai: wgpu adapter request failed: %s", cbFailMsg)
 	}
 	g.adapter = cbAdapter
@@ -462,14 +468,14 @@ func Open(power ...Power) (*Device, error) {
 	runtime.KeepAlive(&desc)
 	runtime.KeepAlive(&req)
 	if cbDevice == 0 {
-		g.Close()
+		g.closeLocked()
 		return nil, fmt.Errorf("tensai: wgpu device request failed: %s", cbFailMsg)
 	}
 	g.device = cbDevice
 	g.queue = fnDeviceGetQueue(g.device)
 
 	uncapturedCB = ""
-	code := cstr(matmulWGSL)
+	code := cstr(src)
 	wgsl := wgpuShaderModuleWGSLDescriptor{
 		chain: wgpuChainedStruct{sType: wgpuSTypeShaderModuleWGSLDescriptor},
 		code:  code,
@@ -480,11 +486,11 @@ func Open(power ...Power) (*Device, error) {
 	runtime.KeepAlive(&smDesc)
 	runtime.KeepAlive(code)
 	if g.module == 0 || uncapturedCB != "" {
-		g.Close()
+		g.closeLocked()
 		return nil, fmt.Errorf("tensai: wgpu shader compilation failed: %s", uncapturedCB)
 	}
 	if err := g.initPipelines(); err != nil {
-		g.Close()
+		g.closeLocked()
 		return nil, err
 	}
 	return g, nil
@@ -541,6 +547,13 @@ func (g *Device) Name() string { return g.name }
 func (g *Device) Close() {
 	wgpuMu.Lock()
 	defer wgpuMu.Unlock()
+	g.closeLocked()
+}
+
+// closeLocked is Close for a caller that already holds wgpuMu -- Open,
+// backing out of a device it could not finish. wgpuMu is not reentrant,
+// so calling Close there would wait on the lock Open itself holds.
+func (g *Device) closeLocked() {
 	if g.closed {
 		return
 	}
