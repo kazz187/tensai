@@ -1958,6 +1958,27 @@ fn embed_scatter(@builtin(workgroup_id) wg: vec3<u32>,
     }
 }
 
+// embed_scatter_cols is embed_scatter without the atomics, for a backend
+// that cannot translate them -- wgpu-native v22's Metal one cannot. One
+// thread owns a column of the table and walks the indices in order, so no
+// two threads ever add into the same element. The rows of a batch run one
+// after another rather than side by side, which is slower, but the sums
+// are the same ones.
+@compute @workgroup_size(256, 1, 1)
+fn embed_scatter_cols(@builtin(workgroup_id) wg: vec3<u32>,
+                      @builtin(num_workgroups) nwg: vec3<u32>,
+                      @builtin(local_invocation_id) lid: vec3<u32>) {
+    let col = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    let d = tp.aCount;
+    if (col >= d) {
+        return;
+    }
+    for (var r = 0u; r < tp.bCount; r = r + 1u) {
+        let dst = tids[r] * d + col;
+        tout[dst] = tout[dst] + ta[r * d + col];
+    }
+}
+
 // slice_cols lifts a column window out of every row. The fused QKV
 // projection lands in one buffer and prefill wants q, k, and v as
 // tensors of their own; a bind offset cannot express that, because the
@@ -2854,8 +2875,9 @@ type gpuPipelines struct {
 	layMatmulV4, layMatmulV4T, layMatmulV4TN       uintptr
 	layMatmulL, layMatmulLT, layMatmulLTN          uintptr
 	lnFwd, lnXhat, lnBwd, softmaxBwd, permute      uintptr
-	embedGather, embedScatter                      uintptr
+	embedGather, embedScatter, embedScatterCols    uintptr
 	layEmbedGather, layEmbedScatter                uintptr
+	layEmbedScatterCols                            uintptr
 	layLnFwd, layLnXhat, layLnBwd                  uintptr
 	laySoftmaxBwd, layPermute                      uintptr
 	scale, softmax, attn, qmatmul                  uintptr
@@ -2925,7 +2947,7 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.softmaxBwd, &g.pipes.laySoftmaxBwd, "softmax_bwd"},
 		{&g.pipes.permute, &g.pipes.layPermute, "permute"},
 		{&g.pipes.embedGather, &g.pipes.layEmbedGather, "embed_gather"},
-		{&g.pipes.embedScatter, &g.pipes.layEmbedScatter, "embed_scatter"},
+		{&g.pipes.embedScatterCols, &g.pipes.layEmbedScatterCols, "embed_scatter_cols"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -2933,6 +2955,17 @@ func (g *Device) initPipelines() error {
 		}
 		*x.lay = fnPipelineGetLayout(*x.pipe, 0)
 	}
+	// The atomic scatter-add is optional: wgpu-native v22's Metal backend
+	// cannot translate atomicCompareExchangeWeak, and without it EmbedGrad
+	// runs embed_scatter_cols instead. Failing Open over it would take the
+	// whole device away from a model that never embeds.
+	if p := g.makePipeline("embed_scatter"); p != 0 && uncapturedCB == "" {
+		g.pipes.embedScatter = p
+		g.pipes.layEmbedScatter = fnPipelineGetLayout(p, 0)
+	} else if p != 0 {
+		fnPipelineRelease(p)
+	}
+	uncapturedCB = ""
 	// The integer-dot module is optional — dot4I8Packed needs a newer
 	// naga — so a compile failure here just leaves the f32 tiled kernel.
 	g.module2 = g.makeModuleFrom(intDotWGSL)
@@ -4595,7 +4628,7 @@ func (t *Tensor) Embed(ids *Tensor) (*Tensor, error) {
 	count := rows * dim
 	p := trainParams{count: uint32(count), aCount: uint32(dim), bCount: uint32(rows)}
 	return t.g.embedOp(t.g.pipes.embedGather, t.g.pipes.layEmbedGather, p, count,
-		[]int{rows, dim}, t, ids, nil)
+		[]int{rows, dim}, t, ids, nil, 0)
 }
 
 // EmbedGrad adds each row of grad into the row of t its index names, which
@@ -4614,14 +4647,21 @@ func (t *Tensor) EmbedGrad(grad, ids *Tensor) error {
 		return fmt.Errorf("tensai: embed gradient has %d elements, want %d", grad.Size(), rows*dim)
 	}
 	p := trainParams{count: uint32(rows * dim), aCount: uint32(dim), bCount: uint32(rows)}
+	if t.g.pipes.embedScatter == 0 {
+		// No atomics on this backend: one thread per column instead.
+		_, err := t.g.embedOp(t.g.pipes.embedScatterCols, t.g.pipes.layEmbedScatterCols, p, dim,
+			nil, grad, ids, t, 49)
+		return err
+	}
 	_, err := t.g.embedOp(t.g.pipes.embedScatter, t.g.pipes.layEmbedScatter, p, rows*dim,
-		nil, grad, ids, t)
+		nil, grad, ids, t, 55)
 	return err
 }
 
-// embedOp dispatches one of the two embedding kernels. outShape is nil for
-// the scatter, which accumulates into the existing buffer bound as atom.
-func (g *Device) embedOp(pipe, lay uintptr, p trainParams, count int, outShape []int, a, ids, atom *Tensor) (*Tensor, error) {
+// embedOp dispatches one of the embedding kernels over count threads.
+// outShape is nil for a scatter, which accumulates into the existing
+// buffer dst, bound at dstBinding.
+func (g *Device) embedOp(pipe, lay uintptr, p trainParams, count int, outShape []int, a, ids, dst *Tensor, dstBinding uint32) (*Tensor, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	wgpuMu.Lock()
@@ -4651,7 +4691,7 @@ func (g *Device) embedOp(pipe, lay uintptr, p trainParams, count int, outShape [
 		entries = append(entries, wgpuBindGroupEntry{binding: 49, buffer: bufOut, size: outBytes})
 		out = &Tensor{g: g, buf: bufOut, shape: append([]int(nil), outShape...)}
 	} else {
-		entries = append(entries, bind(55, atom))
+		entries = append(entries, bind(dstBinding, dst))
 	}
 	bindGroup := g.cachedBindGroup(lay, entries)
 	runtime.KeepAlive(&entries)

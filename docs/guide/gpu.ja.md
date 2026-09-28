@@ -101,7 +101,7 @@ db, _ := gdelta.SumCols()           // バッチにブロードキャストし�
 gw.AdamStep(ggrad, gm, gv, lr, b1, b2, rc1, rc2, eps, 0)
 ```
 
-`LayerNorm`・`LayerNormGrad`・`LayerNormXhat` は最終軸の正規化とその分解、`SoftmaxGrad` は softmax のヤコビアンを 1 パスで適用し、`Permute` は 4 軸までの並べ替え (attention がヘッドを分ける reshape + transpose) を行います。`Embed` は `UploadIndices` で上げた添字列でテーブル行を集め、`EmbedGrad` が勾配を書き戻します。WGSL に f32 のアトミック加算が無いのでビットパターンへの compare-and-swap で実装しており、バッチ内で同じトークンが複数回出ても正しく加算されます。`Activate` と `ActivateGrad` は ReLU・tanh・sigmoid・GELU に対応し、CPU カーネルと同じ式です — ここの GELU は誤差関数版で、推論経路が FFN に融合している tanh 近似ではありません — なので学習の途中でデバイスとホストを行き来できます。`AdamStep` も `optim` のカーネルと一致し、モーメントも含めて同じです。
+`LayerNorm`・`LayerNormGrad`・`LayerNormXhat` は最終軸の正規化とその分解、`SoftmaxGrad` は softmax のヤコビアンを 1 パスで適用し、`Permute` は 4 軸までの並べ替え (attention がヘッドを分ける reshape + transpose) を行います。`Embed` は `UploadIndices` で上げた添字列でテーブル行を集め、`EmbedGrad` が勾配を書き戻します。WGSL に f32 のアトミック加算が無いのでビットパターンへの compare-and-swap で実装しており、バッチ内で同じトークンが複数回出ても正しく加算されます。wgpu-native v22 の Metal バックエンドはこの compare-and-swap を変換できないため、Mac の `-tags wgpu` ビルドでは `Open` がこのカーネルを省き、`EmbedGrad` はテーブルの列ごとに 1 スレッドを割り当てて添字を順に加算するカーネルで代わりに処理します。バッチの行を 1 行ずつ足すので遅くなりますが、和は同じで、そのせいでデバイス全体が使えなくなることもありません。`Activate` と `ActivateGrad` は ReLU・tanh・sigmoid・GELU に対応し、CPU カーネルと同じ式です — ここの GELU は誤差関数版で、推論経路が FFN に融合している tanh 近似ではありません — なので学習の途中でデバイスとホストを行き来できます。`AdamStep` も `optim` のカーネルと一致し、モーメントも含めて同じです。
 
 ## クロスオーバーの測定
 
