@@ -123,6 +123,17 @@ func (n *Node) resident(tp *Tape) (*gpu.Tensor, bool) {
 	return g, true
 }
 
+// dropResident releases a parameter's device copy after its value changed
+// in host memory, so that its next use uploads the new value instead of
+// reading the old one. A parameter's buffer is its own, not the tape's.
+func (n *Node) dropResident() {
+	if n.dev == nil {
+		return
+	}
+	n.dev.Free()
+	n.dev = nil
+}
+
 // residentGrad returns the node's gradient buffer on the device, allocating
 // a zero one the first time. The zeros are made on the device: every node
 // of a step asks for one, and building each on the host to send it over
