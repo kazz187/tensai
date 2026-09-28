@@ -113,7 +113,7 @@ func Param[T Array](v T) *Node {
 func ZeroGrads(nodes ...*Node) {
 	for _, n := range nodes {
 		n.grad = nil
-		n.devGrad = nil
+		n.dropDevGrad()
 	}
 }
 
@@ -139,7 +139,7 @@ func (n *Node) Matrix() *tensai.Matrix {
 // the graph has one.
 func (n *Node) ensureGrad() *tensai.Tensor {
 	n.syncGrad()
-	n.devGrad = nil
+	n.dropDevGrad() // the host copy is the one added into from here on
 	if n.grad == nil {
 		if n.tape != nil {
 			n.grad = n.tape.zeros(n.Shape())

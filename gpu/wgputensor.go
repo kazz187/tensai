@@ -3365,6 +3365,7 @@ type gpuBufferPool struct {
 	pending []pooledBuf
 	bytes   uint64
 	max     uint64 // cap on bytes; see poolLimit
+	made    uint64 // buffers made because the pool had none to give
 }
 
 type pooledBuf struct {
@@ -3422,6 +3423,7 @@ func (g *Device) takeBuffer(usage, size uint64) uintptr {
 		g.pool.bytes -= size
 		return buf
 	}
+	g.pool.made++
 	return g.newBuffer(usage, size)
 }
 
@@ -3745,6 +3747,7 @@ func (g *Device) NewZeroTensor(shape ...int) (*Tensor, error) {
 		}
 		return t, nil
 	}
+	g.pool.made++
 	t.buf = g.newBuffer(gpuTensorUsage, bytes)
 	if t.buf == 0 {
 		return nil, errors.New("tensai: gpu buffer allocation failed")
