@@ -85,6 +85,16 @@ func (t *Tape) freeDevice() {
 		g.Free()
 	}
 	t.devUsed = t.devUsed[:0]
+	// A node that uploaded its host value keeps that value, and an Input
+	// is often fed to the next step as it is -- a fixed batch, or a buffer
+	// refilled in place. Its device copy was just freed, so forget it: the
+	// next use uploads the value again instead of handing the kernels a
+	// freed buffer and quietly running on the CPU.
+	for _, n := range t.uploaded {
+		n.dev = nil
+	}
+	clear(t.uploaded)
+	t.uploaded = t.uploaded[:0]
 }
 
 // device returns the device a node's graph runs on, or nil.
@@ -119,6 +129,7 @@ func (n *Node) resident(tp *Tape) (*gpu.Tensor, bool) {
 	if n.op != "" || !n.requiresGrad {
 		// Intermediates and constants live for one step; parameters stay.
 		n.tape.track(g)
+		n.tape.uploaded = append(n.tape.uploaded, n)
 	}
 	return g, true
 }
