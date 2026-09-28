@@ -104,6 +104,16 @@ gw.AdamStep(ggrad, gm, gv, lr, b1, b2, rc1, rc2, eps, 0)
 
 `LayerNorm`, `LayerNormGrad` and `LayerNormXhat` normalize the last axis and take it apart again, `SoftmaxGrad` applies the softmax Jacobian in one pass, and `Permute` reorders up to four axes -- the reshape-and-transpose attention splits its heads with. `Embed` gathers table rows for a list of indices uploaded with `UploadIndices`, and `EmbedGrad` scatters the gradient back: WGSL has no atomic add for f32, so it is a compare-and-swap on the bit pattern, which lets a token that repeats in a batch accumulate correctly. wgpu-native v22's Metal backend cannot translate that compare-and-swap, so on a Mac with `-tags wgpu` `Open` leaves the kernel out and `EmbedGrad` runs one thread per table column instead, walking the indices in order: slower, since a batch's rows are added one after another, but the same sums, and nothing else loses the device over it. `Activate` and `ActivateGrad` cover ReLU, tanh, sigmoid and GELU, and follow the CPU kernels exactly -- the GELU here is the error function, not the tanh approximation the inference path fuses into its FFN -- so a model can move between device and host mid-training. `AdamStep` matches the `optim` kernel the same way, moments included.
 
+### The buffer pool
+
+A freed tensor goes back to a pool keyed by its size, and the next tensor of that size -- the next step's, in a training loop -- comes out of it instead of a fresh allocation. `NewZeroTensor` draws from it too and clears the buffer with a kernel, which is how a resident graph gets the zero gradient every node starts from without uploading zeros. The pool keeps at most 512MiB. That covers a decode step many times over, but a training step can free more than that at `tape.Reset`, and past the cap every buffer is released for real and the cached bind groups go with it, so the next step allocates and binds everything again. `TENSAI_GPU_POOL_MB` sets the cap in mebibytes when `Open` runs (`0` turns pooling off):
+
+```bash
+TENSAI_GPU_POOL_MB=8192 go run -tags wgpu24 ./your/trainer
+```
+
+On an Apple M5, a 650k-parameter transformer trained at minibatch 256 ran at 354 samples/s under the default cap, 376 at 2048 and 397 at 8192.
+
 ## Measuring the crossover
 
 `_example/wgpu -sweep` walks a ladder of sizes and marks where the GPU overtakes the CPU kernel. Because the CPU side is the same `dotRows` kernel the rest of the package uses, building the example twice compares portable Go, AVX2, and both GPU usage patterns:
