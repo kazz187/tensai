@@ -7,7 +7,7 @@ GOEXPERIMENT=simd go build ./...
 GOEXPERIMENT=simd go test -bench=Dot .
 ```
 
-Requirements: amd64 with Go 1.26 or 1.27 (both `simd` API generations are supported via build tags), or arm64 with Go 1.27, whose `simd/archsimd` is the first to carry an arm64 half. Every other build — other architectures, older Go, or `GOEXPERIMENT` unset — uses the portable fallbacks automatically, with identical results. [Platforms](platforms.md) has the per-kernel breakdown.
+Requirements: amd64 with Go 1.26 or 1.27 (both `simd` API generations are supported via build tags), or arm64 with Go 1.27, whose `simd/archsimd` is the first to carry an arm64 half. Every other build — other architectures, older Go, or `GOEXPERIMENT` unset — uses the portable fallbacks automatically, with the same results up to rounding (and one exception in the matrix products' tiles, below). [Platforms](platforms.md) has the per-kernel breakdown.
 
 ## What is vectorized
 
@@ -33,7 +33,7 @@ Where the AVX2 kernels apply today, and where they still could:
 
 The unchecked items are ordered roughly by expected impact; none of them show up prominently in training profiles today.
 
-The tiles leave every finite result bit for bit as the row-at-a-time kernels did, up to the sign of a zero: each output element is still summed by the same fused multiply-adds in the same order, only alongside its neighbours. What they change is the speed. On one Apple M5 core (`go test -bench GEMM -cpu 1`, 8192 tokens of width 128 into 128 and 512 and back):
+On finite inputs the tiles leave every result bit for bit as the row-at-a-time kernels did, up to the sign of a zero: each output element is still summed by the same fused multiply-adds in the same order, only alongside its neighbours. Infinities and NaNs are the exception. The row kernels, like the portable code, skip a zero in the left operand, where the tiles multiply it in, so inside a tile a zero against an Inf or a NaN in the right operand makes the element NaN where the portable build leaves it finite — as the AVX2 kernel's tiles always have. Past that, what the tiles change is the speed. On one Apple M5 core (`go test -bench GEMM -cpu 1`, 8192 tokens of width 128 into 128 and 512 and back):
 
 | product | row kernels | tiles |
 |---|---|---|
