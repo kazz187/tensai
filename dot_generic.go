@@ -31,6 +31,10 @@ func dotWorkerCount(rows, inner, cols int) int {
 // in dot_simd.go; without vectors there is nothing to gain, so it is the
 // general one.
 func dotTATall(out, a, b *Matrix, lo, hi int) {
+	// dotTARowsGeneric accumulates, where the vector builds' register
+	// kernels store their sums; DotTAInto hands this path an output it has
+	// not cleared, so clear the rows it owns first.
+	clear(out.Data[lo*b.Cols : hi*b.Cols])
 	dotTARowsGeneric(out, a, b, lo, hi)
 }
 
