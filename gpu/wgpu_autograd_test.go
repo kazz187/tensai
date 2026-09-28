@@ -194,6 +194,62 @@ func TestGPUResidentSGD(t *testing.T) {
 	}
 }
 
+// TestGPUResidentGradientsReused trains an MLP on a device tape and checks
+// that once the first steps have filled the pool, a step makes no new
+// buffer: everything it needs is one the step before gave back. The tape
+// frees what a step's operations made, but a parameter's gradient is the
+// parameter's own, so clearing the gradients has to free it -- after an
+// Adam update on the device, after an SGD update in host memory, and when
+// an operation without a device kernel brings the gradient home halfway
+// through the backward pass.
+func TestGPUResidentGradientsReused(t *testing.T) {
+	t.Setenv("TENSAI_GPU_POOL_MB", "") // the default pool, whatever the shell says
+	g := openTestGPU(t)
+	defer g.Close()
+
+	for _, c := range []struct {
+		name   string
+		opt    optim.Optimizer
+		hostOp bool // add a term whose backward runs on the CPU
+	}{
+		{"adam", optim.NewAdam(0.01), false},
+		{"sgd", optim.NewSGD(0.02, 0.9), false},
+		{"adam with a host op", optim.NewAdam(0.01), true},
+	} {
+		rng := rand.New(rand.NewPCG(113, 0))
+		x, y := randTensor(rng, 32, 24), randTensor(rng, 32, 8)
+		w1 := autograd.Param(randTensor(rng, 24, 40))
+		b1 := autograd.Param(tensai.NewTensor(1, 40))
+		w2 := autograd.Param(randTensor(rng, 40, 8))
+		trainer := autograd.NewTrainer(c.opt, w1, b1, w2)
+		tape := autograd.NewTape()
+		tape.UseDevice(g)
+		tape.Bind(w1, b1, w2)
+		in := autograd.Input(x)
+		step := func() {
+			loss := in.MatMul(w1).Add(b1).Tanh().MatMul(w2).MSELoss(y)
+			if c.hostOp {
+				// SumAxis has no device kernel, and its backward runs
+				// after the product's has added into w1's gradient on the
+				// device, so it downloads that gradient to add to it.
+				loss = w1.SumAxis(0, false).Sum().Scale(1e-3).Add(loss)
+			}
+			trainer.Step(loss)
+			tape.Reset()
+		}
+		for i := 0; i < 3; i++ {
+			step()
+		}
+		made := gpu.BuffersMade(g)
+		for i := 0; i < 4; i++ {
+			step()
+		}
+		if n := gpu.BuffersMade(g) - made; n != 0 {
+			t.Errorf("%s: four more steps made %d buffers", c.name, n)
+		}
+	}
+}
+
 // TestGPUResidentInputReuse feeds one Input node to several steps of a
 // device tape, refilling its data in between, the way a fixed batch or a
 // buffer loaded in place is fed. Reset frees the copy the node uploaded;

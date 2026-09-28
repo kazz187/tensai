@@ -126,13 +126,18 @@ func (n *Node) resident(tp *Tape) (*gpu.Tensor, bool) {
 		return nil, false
 	}
 	n.dev = g
-	if n.op != "" || !n.requiresGrad {
+	if !n.isParam() {
 		// Intermediates and constants live for one step; parameters stay.
 		n.tape.track(g)
 		n.tape.uploaded = append(n.tape.uploaded, n)
 	}
 	return g, true
 }
+
+// isParam reports whether the node is a trainable leaf. Its device buffers
+// are its own: the tape frees what a step's operations made and what it
+// uploaded for them, and a parameter's copies outlive the step.
+func (n *Node) isParam() bool { return n.op == "" && n.requiresGrad }
 
 // dropResident releases a parameter's device copy after its value changed
 // in host memory, so that its next use uploads the new value instead of
@@ -169,10 +174,24 @@ func (n *Node) residentGrad() (*gpu.Tensor, bool) {
 	}
 	n.devGrad = g
 	n.grad = nil // the device copy is the authoritative one now
-	if n.op != "" || !n.requiresGrad {
+	if !n.isParam() {
 		n.tape.track(g)
 	}
 	return g, true
+}
+
+// dropDevGrad forgets the node's device gradient. A parameter's goes back
+// to the pool here, since the tape does not free it: dropped without a
+// Free, it stayed allocated until the device closed, and every step made
+// a new one.
+func (n *Node) dropDevGrad() {
+	if n.devGrad == nil {
+		return
+	}
+	if n.isParam() {
+		n.devGrad.Free()
+	}
+	n.devGrad = nil
 }
 
 // syncValue brings a device-resident value home. Value calls it, so a
