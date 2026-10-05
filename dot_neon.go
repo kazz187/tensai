@@ -9,15 +9,15 @@ import (
 	"github.com/mattn/tensai/internal/simd"
 )
 
-// The dense float matmuls on arm64. A product with four or more rows runs
-// in 4x16 register tiles: sixteen accumulators hold a block of the output
-// across the whole contraction, so each loaded row of b feeds four rows
-// and the output is written once, where the row-at-a-time kernel read it
-// back and stored it for every element of a. Whatever the tiles leave --
-// a column tail short of 16, rows short of 4 -- goes through that row
-// kernel, 4-lane NEON vectors unrolled four deep with part loads for the
-// tail. The multiply-add is fused, as the arm64 compiler fuses the
-// portable bodies' `out += a*b`.
+// The dense float matmuls on arm64. The forward product runs in register
+// tiles of four rows by 16 columns (dot_tile_arm64.s): sixteen accumulators
+// hold a block of the output across the whole contraction, so each loaded
+// row of b feeds four rows and the output is written once, where the
+// row-at-a-time kernel read it back and stored it for every element of a.
+// Rows short of four go through tiles of three, two or one row. A column
+// tail short of 16 goes through that row kernel, 4-lane NEON vectors
+// unrolled four deep with part loads for the tail. The multiply-add is
+// fused, as the arm64 compiler fuses the portable bodies' `out += a*b`.
 
 // dotRows computes rows lo..hi of out = a * b.
 func dotRows(out, a, b *Matrix, lo, hi int) {
@@ -29,16 +29,41 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 		clear(out.Data[lo*cols : hi*cols])
 		return
 	}
-	if hi-lo >= 4 && cols >= 16 {
-		r4 := lo + (hi-lo)&^3
+	if cols >= 16 {
 		n16 := cols &^ 15
-		dotRowsTiled(out, a, b, lo, r4, n16)
-		if n16 < cols {
-			dotRowsAxpy(out, a, b, lo, r4, n16)
+		// The tiles multiply every element of a; the row kernel skips the
+		// zeros. Rows short of a full tile of four -- a product of one to
+		// three rows, or the rows the tiles of four leave -- stay on the row
+		// kernel when they are mostly zeros (a one-hot or sparse input at
+		// batch one), where skipping beats the short tiles.
+		tiled := hi
+		if r4 := lo + (hi-lo)&^3; r4 < hi && sparseRows(a, r4, hi) {
+			tiled = r4
 		}
-		lo = r4
+		dotRowsTiled(out, a, b, lo, tiled, n16)
+		if n16 < cols {
+			dotRowsAxpy(out, a, b, lo, tiled, n16)
+		}
+		if tiled < hi {
+			dotRowsAxpy(out, a, b, tiled, hi, 0)
+		}
+		return
 	}
 	dotRowsAxpy(out, a, b, lo, hi, 0)
+}
+
+// sparseRows reports whether fewer than a third of the elements of a's rows
+// lo..hi are nonzero: below that the row kernel, which skips zeros, beats
+// the short tiles on an M5 (measured from about a quarter to two fifths
+// nonzero, by width).
+func sparseRows(a *Matrix, lo, hi int) bool {
+	nz := 0
+	for _, v := range a.Data[lo*a.Cols : hi*a.Cols] {
+		if v != 0 {
+			nz++
+		}
+	}
+	return 3*nz < (hi-lo)*a.Cols
 }
 
 // dotRowsAxpy computes rows lo..hi, columns c0..b.Cols of out = a * b one
@@ -106,65 +131,52 @@ func dotRowsAxpy(out, a, b *Matrix, lo, hi, c0 int) {
 // M5; four times, no better again.
 const dotTileK = 512
 
-// dotRowsTiled computes rows lo..hi (a multiple of 4 apart), columns
-// 0..n16 (a multiple of 16) of out = a * b in 4x16 register tiles. Each
-// tile accumulates in k order with fused multiply-adds starting from zero,
-// so a finite result comes out bit for bit as dotRowsAxpy leaves it: a
-// zero element of a adds an exact zero where the row kernel skips it.
-// Only the sign of a zero result can differ, and an Inf or NaN in b
-// meeting a zero in a, which the row kernel never multiplies.
+// dotRowsTiled computes rows lo..hi, columns 0..n16 (a multiple of 16) of
+// out = a * b in register tiles of 4 x 16, and 3, 2 or 1 x 16 for the rows
+// short of four. Each tile accumulates in k order with fused multiply-adds
+// starting from zero, so a finite result comes out bit for bit as
+// dotRowsAxpy leaves it: a zero element of a adds an exact zero where the
+// row kernel skips it. Only the sign of a zero result can differ, and an
+// Inf or NaN in b meeting a zero in a, which the row kernel never
+// multiplies.
 func dotRowsTiled(out, a, b *Matrix, lo, hi, n16 int) {
-	for k0 := 0; k0 < a.Cols; k0 += dotTileK {
-		k1 := min(k0+dotTileK, a.Cols)
+	n, kk := b.Cols, a.Cols
+	if hi <= lo || n16 == 0 {
+		return
+	}
+	// The assembly reads and writes through pointers. Every element it
+	// touches is at most (hi-1)*n+n16-1 into out, hi*kk-1 into a and
+	// (kk-1)*n+n16-1 into b; check those against the slices in a form that
+	// cannot overflow, as a shape that disagrees with len(Data) could make
+	// the products wrap (n >= n16 >= 16 and kk >= 1 here).
+	if n16 > len(out.Data) || uint(hi-1) > uint(len(out.Data)-n16)/uint(n) ||
+		uint(hi) > uint(len(a.Data))/uint(kk) ||
+		n16 > len(b.Data) || uint(kk-1) > uint(len(b.Data)-n16)/uint(n) {
+		panic("tensai: matrix data shorter than its shape")
+	}
+	un, ukk := uintptr(n), uintptr(kk)
+	for k0 := 0; k0 < kk; k0 += dotTileK {
+		k1 := min(k0+dotTileK, kk)
+		depth, load := uintptr(k1-k0), uintptr(0)
+		if k0 > 0 {
+			load = 1
+		}
 		for c := 0; c < n16; c += 16 {
-			for r := lo; r < hi; r += 4 {
-				dotTile4x16(out, a, b, r, c, k0, k1)
+			bp := &b.Data[k0*n+c]
+			r := lo
+			for ; r+4 <= hi; r += 4 {
+				tile4x16(&out.Data[r*n+c], &a.Data[r*kk+k0], bp, un, ukk, un, depth, load)
+			}
+			switch hi - r {
+			case 3:
+				tile3x16(&out.Data[r*n+c], &a.Data[r*kk+k0], bp, un, ukk, un, depth, load)
+			case 2:
+				tile2x16(&out.Data[r*n+c], &a.Data[r*kk+k0], bp, un, ukk, un, depth, load)
+			case 1:
+				tile1x16(&out.Data[r*n+c], &a.Data[r*kk+k0], bp, un, ukk, un, depth, load)
 			}
 		}
 	}
-}
-
-// dotTile4x16 adds a[r:r+4, k0:k1] * b[k0:k1, c:c+16] into the 4x16 tile of
-// out at (r, c), or writes it there when k0 is 0. Sixteen accumulators,
-// four loads of b and a broadcast per row use 21 of the 32 vector
-// registers.
-func dotTile4x16(out, a, b *Matrix, r, c, k0, k1 int) {
-	n, kk := b.Cols, a.Cols
-	o0 := out.Data[r*n+c : r*n+c+16]
-	o1 := out.Data[(r+1)*n+c : (r+1)*n+c+16]
-	o2 := out.Data[(r+2)*n+c : (r+2)*n+c+16]
-	o3 := out.Data[(r+3)*n+c : (r+3)*n+c+16]
-	var c00, c01, c02, c03, c10, c11, c12, c13 archsimd.Float32x4
-	var c20, c21, c22, c23, c30, c31, c32, c33 archsimd.Float32x4
-	if k0 > 0 {
-		c00, c01, c02, c03 = simd.LoadF32x4(o0), simd.LoadF32x4(o0[4:]), simd.LoadF32x4(o0[8:]), simd.LoadF32x4(o0[12:])
-		c10, c11, c12, c13 = simd.LoadF32x4(o1), simd.LoadF32x4(o1[4:]), simd.LoadF32x4(o1[8:]), simd.LoadF32x4(o1[12:])
-		c20, c21, c22, c23 = simd.LoadF32x4(o2), simd.LoadF32x4(o2[4:]), simd.LoadF32x4(o2[8:]), simd.LoadF32x4(o2[12:])
-		c30, c31, c32, c33 = simd.LoadF32x4(o3), simd.LoadF32x4(o3[4:]), simd.LoadF32x4(o3[8:]), simd.LoadF32x4(o3[12:])
-	}
-	a0 := a.Data[r*kk+k0 : r*kk+k1]
-	a1 := a.Data[(r+1)*kk+k0 : (r+1)*kk+k1]
-	a2 := a.Data[(r+2)*kk+k0 : (r+2)*kk+k1]
-	a3 := a.Data[(r+3)*kk+k0 : (r+3)*kk+k1]
-	a1, a2, a3 = a1[:len(a0)], a2[:len(a0)], a3[:len(a0)]
-	bd, bi := b.Data, k0*n+c
-	for k := range a0 {
-		bRow := bd[bi : bi+16]
-		bi += n
-		b0, b1, b2, b3 := simd.LoadF32x4(bRow), simd.LoadF32x4(bRow[4:]), simd.LoadF32x4(bRow[8:]), simd.LoadF32x4(bRow[12:])
-		v := archsimd.BroadcastFloat32x4(a0[k])
-		c00, c01, c02, c03 = b0.MulAdd(v, c00), b1.MulAdd(v, c01), b2.MulAdd(v, c02), b3.MulAdd(v, c03)
-		v = archsimd.BroadcastFloat32x4(a1[k])
-		c10, c11, c12, c13 = b0.MulAdd(v, c10), b1.MulAdd(v, c11), b2.MulAdd(v, c12), b3.MulAdd(v, c13)
-		v = archsimd.BroadcastFloat32x4(a2[k])
-		c20, c21, c22, c23 = b0.MulAdd(v, c20), b1.MulAdd(v, c21), b2.MulAdd(v, c22), b3.MulAdd(v, c23)
-		v = archsimd.BroadcastFloat32x4(a3[k])
-		c30, c31, c32, c33 = b0.MulAdd(v, c30), b1.MulAdd(v, c31), b2.MulAdd(v, c32), b3.MulAdd(v, c33)
-	}
-	storeTile4x16(o0, o1, o2, o3, [16]archsimd.Float32x4{
-		c00, c01, c02, c03, c10, c11, c12, c13,
-		c20, c21, c22, c23, c30, c31, c32, c33,
-	})
 }
 
 // storeTile4x16 writes a 4x16 tile of accumulators back to its four rows.

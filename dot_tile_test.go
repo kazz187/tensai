@@ -19,6 +19,9 @@ func TestDotRowsTiledMatchesAxpy(t *testing.T) {
 	for _, sh := range [][3]int{
 		{4, 16, 16}, {7, 33, 17}, {12, 300, 48}, {9, 600, 70}, {32, 1, 64}, {5, 257, 31}, {64, 512, 144},
 		{8, 1100, 32}, {13, 513, 50},
+		// Every short tile (3, 2 and 1 rows) over depths that leave each
+		// remainder of four, and past dotTileK.
+		{1, 3, 16}, {2, 37, 48}, {3, 1029, 32}, {6, 5, 16}, {58, 387, 128}, {58, 512, 130},
 	} {
 		m, k, n := sh[0], sh[1], sh[2]
 		a, b := NewMatrix(m, k), NewMatrix(k, n)
@@ -70,5 +73,33 @@ func BenchmarkDotTall(b *testing.B) {
 			}
 			b.ReportMetric(2*float64(m)*float64(k)*float64(n)*float64(b.N)/b.Elapsed().Seconds()/1e9, "GFLOPS")
 		})
+	}
+}
+
+// A matrix whose data is shorter than its shape -- Matrix's fields are
+// exported, and the shape checks compare only Rows and Cols -- must panic
+// before a tile touches memory past the slice, including when the shape is
+// large enough that the index arithmetic would wrap.
+func TestDotRowsTiledShortDataPanics(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		out, a *Matrix
+		b      *Matrix
+	}{
+		{"short out", &Matrix{Rows: 4, Cols: 32, Data: make([]float32, 100)}, NewMatrix(4, 8), NewMatrix(8, 32)},
+		{"short b", NewMatrix(4, 32), NewMatrix(4, 8), &Matrix{Rows: 8, Cols: 32, Data: make([]float32, 200)}},
+		{"wrapping cols", &Matrix{Rows: 4, Cols: 1<<62 + 16, Data: make([]float32, 64)}, NewMatrix(4, 4),
+			&Matrix{Rows: 4, Cols: 1<<62 + 16, Data: make([]float32, 64)}},
+		{"wrapping rows", &Matrix{Rows: 1<<60 + 1, Cols: 16, Data: make([]float32, 16)},
+			&Matrix{Rows: 1<<60 + 1, Cols: 16, Data: make([]float32, 16)}, NewMatrix(16, 16)},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: no panic", c.name)
+				}
+			}()
+			dotRows(c.out, c.a, c.b, 0, c.a.Rows)
+		}()
 	}
 }
