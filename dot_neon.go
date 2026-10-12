@@ -21,6 +21,12 @@ import (
 
 // dotRows computes rows lo..hi of out = a * b.
 func dotRows(out, a, b *Matrix, lo, hi int) {
+	if hi <= lo {
+		// Nothing to do. An empty range must not go on: with lo > hi the
+		// tile split below would round lo+(hi-lo)&^3 into [hi-3, hi) and
+		// recompute rows another worker owns, at the same time.
+		return
+	}
 	cols := b.Cols
 	if a.Cols == 0 {
 		// An empty contraction sums nothing. The tiles' loop over it would

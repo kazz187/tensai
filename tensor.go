@@ -197,6 +197,13 @@ func DotInto(out, a, b *Matrix) error {
 		if hi > a.Rows {
 			hi = a.Rows
 		}
+		if lo >= hi {
+			// Rounding the chunk up can leave the last workers nothing:
+			// 17 rows over 8 workers is chunks of 3, and the seventh
+			// would start at row 18. Their empty ranges must not reach
+			// the row kernels.
+			break
+		}
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()
@@ -244,6 +251,9 @@ func DotTAInto(out, a, b *Matrix) error {
 		lo, hi := w*chunk, (w+1)*chunk
 		if hi > a.Cols {
 			hi = a.Cols
+		}
+		if lo >= hi {
+			break // as in DotInto: no empty ranges
 		}
 		wg.Add(1)
 		go func(lo, hi int) {
@@ -294,6 +304,13 @@ func DotTBInto(out, a, b *Matrix) error {
 		lo, hi := w*chunk, (w+1)*chunk
 		if hi > a.Rows {
 			hi = a.Rows
+		}
+		if lo >= hi {
+			// Rounding the chunk up can leave the last workers nothing:
+			// 17 rows over 8 workers is chunks of 3, and the seventh
+			// would start at row 18. Their empty ranges must not reach
+			// the row kernels.
+			break
 		}
 		wg.Add(1)
 		go func(lo, hi int) {
