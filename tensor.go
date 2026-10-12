@@ -100,13 +100,22 @@ func (m *Matrix) T() *Matrix {
 	return out
 }
 
-// EnsureMatrix returns m when it already has the wanted shape, otherwise a
-// freshly allocated matrix. The contents are unspecified; callers must
-// overwrite (or clear) every element. Layers use this to reuse forward and
-// backward scratch buffers between training steps.
+// EnsureMatrix returns m when it already has the wanted shape, m reshaped in
+// place when its backing array holds rows*cols elements, otherwise a freshly
+// allocated matrix. The contents are unspecified; callers must overwrite (or
+// clear) every element. Layers use this to reuse forward and backward scratch
+// buffers between steps, including when the row count changes from call to
+// call (a sequence of a different length each time): without the reshape every
+// such call allocated, and zeroed, a new buffer.
 func EnsureMatrix(m *Matrix, rows, cols int) *Matrix {
-	if m != nil && m.Rows == rows && m.Cols == cols {
-		return m
+	if m != nil {
+		if m.Rows == rows && m.Cols == cols {
+			return m
+		}
+		if n := rows * cols; rows >= 0 && cols >= 0 && n <= cap(m.Data) {
+			m.Rows, m.Cols, m.Data = rows, cols, m.Data[:n]
+			return m
+		}
 	}
 	return NewMatrix(rows, cols)
 }
