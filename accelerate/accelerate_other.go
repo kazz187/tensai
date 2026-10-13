@@ -10,4 +10,6 @@ func available() bool { return false }
 
 func loadErr() error { return errUnsupported }
 
+func availableTB() bool { return false }
+
 func gemm(bool, int, int, int, []float32, []float32, []float32) {}

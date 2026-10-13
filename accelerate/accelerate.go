@@ -46,7 +46,7 @@ func DotTBInto(out, a, b *tensai.Matrix) error {
 	if a.Cols != b.Cols || out.Rows != a.Rows || out.Cols != b.Rows {
 		return tensai.DotTBIntoSerial(out, a, b)
 	}
-	if !available() || a.Rows < 2 || b.Rows < 16 {
+	if !availableTB() || a.Rows < 2 || b.Rows < 16 {
 		return tensai.DotTBIntoSerial(out, a, b)
 	}
 	if a.Cols == 0 {

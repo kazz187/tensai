@@ -43,6 +43,7 @@ var asyncSignals = func() uint32 {
 var (
 	once                            sync.Once
 	errLoad                         error
+	errTB                           error // a*b^T differs from tensai's (DotTBInto then runs on tensai)
 	fnSgemm, fnSetThreading, fnMask uintptr
 	argPool                         = sync.Pool{New: func() any { return new(gemmArgs) }}
 )
@@ -78,7 +79,7 @@ func load() {
 		errLoad = fmt.Errorf("accelerate: pthread_sigmask: %w", err)
 		return
 	}
-	errLoad = selfTest()
+	errLoad, errTB = selfTest()
 }
 
 func available() bool {
@@ -89,6 +90,11 @@ func available() bool {
 func loadErr() error {
 	once.Do(load)
 	return errLoad
+}
+
+func availableTB() bool {
+	once.Do(load)
+	return errLoad == nil && errTB == nil
 }
 
 // gemm runs C = A * op(B) in row-major order (A is m x k, C is m x n, B is k x n, or n x k when transB) as the
@@ -125,12 +131,13 @@ func gemm(transB bool, m, n, k int, a, b, c []float32) {
 	argPool.Put(p)
 }
 
-// selfTest checks that Accelerate gives tensai's bits on the products callers send it (the shapes of a small
-// transformer: K x N of 387x128, 128x384, 128x128, 128x512, 512x128 and 32x128 over a range of row counts, half of the
-// rows sparse like one-hot features, and a*b^T). Both sum each element over k in order with one fused multiply-add
-// per step, so they agree on this machine; if a future OS or chip sums otherwise, Available reports false and every
-// product falls back to tensai.
-func selfTest() error {
+// selfTest checks that Accelerate gives tensai's bits on the products callers send it: a*b at the shapes of a small
+// transformer (K x N of 387x128, 128x384, 128x128, 128x512, 512x128 and 32x128 over a range of row counts, half of
+// the rows sparse like one-hot features), and separately a*b^T. For a*b both sum each element over k in order with
+// one fused multiply-add per step, so they agree on this machine; if a future OS or chip sums otherwise, Available
+// reports false and every product falls back to tensai. tensai's SIMD a*b^T sums in vector lanes and adds them at the
+// end, so it differs from Accelerate in GOEXPERIMENT=simd builds; then only DotTBInto falls back.
+func selfTest() (dot, tb error) {
 	rng := rand.New(rand.NewPCG(11, 13)) //nolint:gosec // test data
 	mat := func(rows, cols int, sparse bool) *tensai.Matrix {
 		m := tensai.NewMatrix(rows, cols)
@@ -157,10 +164,11 @@ func selfTest() error {
 			got, want := tensai.NewMatrix(m, n), tensai.NewMatrix(m, n)
 			gemm(false, m, n, k, a.Data, w.Data, got.Data)
 			if err := tensai.DotIntoSerial(want, a, w); err != nil {
-				return err
+				return err, err
 			}
 			if !same(got.Data, want.Data) {
-				return fmt.Errorf("accelerate: results differ from tensai at %dx%dx%d; using tensai", m, k, n)
+				err := fmt.Errorf("accelerate: results differ from tensai at %dx%dx%d; using tensai", m, k, n)
+				return err, err
 			}
 		}
 	}
@@ -168,10 +176,10 @@ func selfTest() error {
 	got, want := tensai.NewMatrix(58, 384), tensai.NewMatrix(58, 384)
 	gemm(true, 58, 384, 128, a.Data, bt.Data, got.Data)
 	if err := tensai.DotTBIntoSerial(want, a, bt); err != nil {
-		return err
+		return nil, err
 	}
 	if !same(got.Data, want.Data) {
-		return fmt.Errorf("accelerate: a*b^T results differ from tensai; using tensai")
+		return nil, fmt.Errorf("accelerate: a*b^T results differ from tensai's; DotTBInto uses tensai")
 	}
-	return nil
+	return nil, nil
 }
