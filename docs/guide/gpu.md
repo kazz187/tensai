@@ -69,6 +69,26 @@ out, _ = gq.MultiHeadAttention(gk, gv, heads)  // packed (batch, seq, heads*dh) 
 
 Multi-head attention carves each head out of the packed layout with strided kernels, so no permute is ever materialized. The causal variants (`CausalAttention`, `CausalMultiHeadAttention`) mask future positions inside the kernel, with k and v allowed to hold more positions than q — the prompt-prefill and chunked-decode patterns of autoregressive models — so no mask tensor is ever built either. `CausalMultiHeadAttention` runs as one fused flash-attention-style dispatch (an online softmax over kv tiles, for head dimensions up to 128): the scores matrix never exists, so memory stays at q+k+v+output regardless of sequence length.
 
+### Packed variable-length attention
+
+Many short sequences -- the positions of a batch of games, sentences of different lengths -- run as one dispatch without padding: pack their rows one after another, describe the packing once with `NewSegments`, and pass it to `SegmentAttention` in every layer:
+
+```go
+seg, _ := dev.NewSegments(rows, off, flags) // segment s is rows [off[s], off[s+1]); one gpu.RowFlag per row
+defer seg.Free()
+qkv, _ := y.Linear(wqkv, nil)               // (rows, 3d): q|k|v of every row
+att, _ := dev.SegmentAttention(gpu.SegAttn{
+	Seg: seg, Heads: heads, Dim: d,
+	Q: qkv, K: qkv, V: qkv, KCol: d, VCol: 2 * d, // columns of the fused projection, no copies
+})
+```
+
+A query attends only to the keys of its own segment, and `gpu.RowQueryOnly` keeps a row out of the keys. `QRows`, an `UploadIndices` list of packed rows, computes only the queries a last layer reads -- the first row of each segment, say -- with `Q` holding just those rows. `Gate`, one weight per head, splits each segment's keys into the `gpu.RowGated` ones and the rest: a query gets attention over the rest plus the weight times attention over the gated keys, while a `gpu.RowSeesAll` query attends to all of them as usual. One thread computes one (query, head) with an online softmax, so the scores never exist, and the 64 queries of a workgroup stage their keys and values through workgroup memory. Heads may have up to 128 dimensions, a multiple of four.
+
+`PairDot` scores pairs of rows, `scale * <t[ia[i]], o[ib[i]]>`, so a pointer head can score every option against its segment's query on the device. `DownloadInto`, `DownloadRangeInto` and `DownloadRowsInto` read results into a buffer the caller reuses, the last only the rows an index list names.
+
+`LayerNorm` gives rows of up to 1024 columns (a multiple of four) eight threads each instead of a 256-thread workgroup, most of which a narrow row leaves idle: on 65536 rows of 128 it runs about six times faster on an Apple M5.
+
 ## Quantized weights on the device
 
 `UploadQ8` packs a `QMatrix` four int8 weights per u32, and `gpu.QMatrix.MatMul` dequantizes them in registers, so a decode matvec moves a quarter of the f32 bytes. `UploadQ4` does the same for the int4 twin, so `-q4 -gpu` runs models whose int8 weights would not fit.

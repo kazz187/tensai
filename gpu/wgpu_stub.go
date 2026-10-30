@@ -296,3 +296,38 @@ func (q *Q4Matrix) Free() {}
 
 // RMSNormEach always fails in builds without the wgpu tag.
 func (t *Tensor) RMSNormEach(w *Tensor, eps float64) (*Tensor, error) { return nil, errNoWGPU }
+
+// Segments splits packed rows for SegmentAttention; this build has it
+// disabled.
+type Segments struct{}
+
+// NewSegments always fails in builds without the wgpu tag.
+func (g *Device) NewSegments(rows int, off []int, flags []RowFlag) (*Segments, error) {
+	return nil, errNoWGPU
+}
+
+// Rows returns 0 in builds without the wgpu tag.
+func (s *Segments) Rows() int { return 0 }
+
+// Len returns 0 in builds without the wgpu tag.
+func (s *Segments) Len() int { return 0 }
+
+// Free is a no-op in builds without the wgpu tag.
+func (s *Segments) Free() {}
+
+// SegmentAttention always fails in builds without the wgpu tag.
+func (g *Device) SegmentAttention(a SegAttn) (*Tensor, error) { return nil, errNoWGPU }
+
+// PairDot always fails in builds without the wgpu tag.
+func (t *Tensor) PairDot(o, ia, ib *Tensor, scale float32) (*Tensor, error) {
+	return nil, errNoWGPU
+}
+
+// DownloadInto always fails in builds without the wgpu tag.
+func (t *Tensor) DownloadInto(dst []tensai.Float) error { return errNoWGPU }
+
+// DownloadRangeInto always fails in builds without the wgpu tag.
+func (t *Tensor) DownloadRangeInto(off int, dst []tensai.Float) error { return errNoWGPU }
+
+// DownloadRowsInto always fails in builds without the wgpu tag.
+func (t *Tensor) DownloadRowsInto(ids *Tensor, dst []tensai.Float) error { return errNoWGPU }

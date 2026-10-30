@@ -3015,7 +3015,9 @@ type gpuPipelines struct {
 	layAttnF16, layRowsToF16                       uintptr
 	qmatmulSK, qmatmulSKR, layQmatmulSK            uintptr
 	layQmatmulSKR                                  uintptr
-	gemm                                           []gemmPipe // per gemmTiles entry; nil without module4
+	gemm                                           []gemmPipe          // per gemmTiles entry; nil without module4
+	lazy                                           map[string]gemmPipe // compiled on first use, see lazyPipe
+	lazyMods                                       map[string]uintptr  // the modules behind lazy
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -3176,6 +3178,7 @@ func (g *Device) releasePipelines() {
 		}
 	}
 	g.releaseGemm()
+	g.releaseLazy()
 }
 
 // dispatch runs one compute pass and pumps the error callback once; the
@@ -3908,46 +3911,10 @@ func (t *Tensor) Download() (*tensai.Tensor, error) {
 	if t.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
-	g := t.g
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	wgpuMu.Lock()
-	defer wgpuMu.Unlock()
-	if g.closed {
-		return nil, errors.New("tensai: gpu is closed")
-	}
-	if err := g.flushLocked(); err != nil {
-		return nil, err
-	}
 	out := tensai.NewTensor(t.shape...)
-	bytes := uint64(len(out.Data)) * 4
-	staging, stagingSize := g.takeReadback(bytes)
-	if staging == 0 {
-		return nil, errors.New("tensai: gpu readback buffer allocation failed")
-	}
-	reuse := false
-	defer func() {
-		if reuse {
-			g.putReadback(staging, stagingSize)
-		} else {
-			fnBufferRelease(staging)
-		}
-	}()
-
-	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
-	fnEncoderCopyBuffer(encoder, t.buf, t.off, staging, 0, bytes)
-	cmd := fnEncoderFinish(encoder, nil)
-	fnCmdEncoderRelease(encoder)
-	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
-	fnCmdBufferRelease(cmd)
-
-	src, err := g.mapRead(staging, bytes)
-	if err != nil {
+	if err := t.readInto(0, out.Data); err != nil {
 		return nil, err
 	}
-	copy(out.Data, unsafe.Slice((*tensai.Float)(src), len(out.Data)))
-	fnBufferUnmap(staging)
-	reuse = true
 	return out, nil
 }
 
@@ -3962,22 +3929,32 @@ func (t *Tensor) DownloadRange(off, n int) (*tensai.Tensor, error) {
 	if off < 0 || n <= 0 || off+n > t.Size() {
 		return nil, fmt.Errorf("tensai: download of %d elements at %d overflows %d", n, off, t.Size())
 	}
+	out := tensai.NewTensor(n)
+	if err := t.readInto(off, out.Data); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// readInto copies len(dst) elements of t starting at element off into
+// dst, flushing an open batch first: the work behind Download,
+// DownloadRange and their Into forms, whose callers check the range.
+func (t *Tensor) readInto(off int, dst []tensai.Float) error {
 	g := t.g
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	wgpuMu.Lock()
 	defer wgpuMu.Unlock()
 	if g.closed {
-		return nil, errors.New("tensai: gpu is closed")
+		return errors.New("tensai: gpu is closed")
 	}
 	if err := g.flushLocked(); err != nil {
-		return nil, err
+		return err
 	}
-	out := tensai.NewTensor(n)
-	bytes := uint64(n) * 4
+	bytes := uint64(len(dst)) * 4
 	staging, stagingSize := g.takeReadback(bytes)
 	if staging == 0 {
-		return nil, errors.New("tensai: gpu readback buffer allocation failed")
+		return errors.New("tensai: gpu readback buffer allocation failed")
 	}
 	reuse := false
 	defer func() {
@@ -3995,12 +3972,12 @@ func (t *Tensor) DownloadRange(off, n int) (*tensai.Tensor, error) {
 	fnCmdBufferRelease(cmd)
 	src, err := g.mapRead(staging, bytes)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	copy(out.Data, unsafe.Slice((*tensai.Float)(src), n))
+	copy(dst, unsafe.Slice((*tensai.Float)(src), len(dst)))
 	fnBufferUnmap(staging)
 	reuse = true
-	return out, nil
+	return nil
 }
 
 // Free releases the Device buffer (into the transient pool, from which the
@@ -4783,6 +4760,9 @@ func (t *Tensor) LayerNorm(gain, bias *Tensor, eps tensai.Float) (*Tensor, error
 	if gain.Size() != cols || bias.Size() != cols {
 		return nil, fmt.Errorf("tensai: layernorm gain and bias must hold %d elements", cols)
 	}
+	if out, ok, err := t.layerNormRows(gain, bias, eps, rows, cols); ok {
+		return out, err
+	}
 	p := trainParams{count: uint32(cols), rows: uint32(rows), eps: float32(eps)}
 	return t.g.trainRows(t.g.pipes.lnFwd, t.g.pipes.layLnFwd, p, rows, t.shape, t, gain, bias)
 }
@@ -4902,6 +4882,12 @@ func (g *Device) UploadIndices(ids []int) (*Tensor, error) {
 		}
 		raw[i] = uint32(id)
 	}
+	return g.uploadWords(raw, []int{len(raw)})
+}
+
+// uploadWords puts u32 words on the device as a tensor of the given
+// shape, a handle for the kernels that read them as such.
+func (g *Device) uploadWords(raw []uint32, shape []int) (*Tensor, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	wgpuMu.Lock()
@@ -4919,7 +4905,7 @@ func (g *Device) UploadIndices(ids []int) (*Tensor, error) {
 	}
 	fnQueueWriteBuffer(g.queue, buf, 0, unsafe.Pointer(&raw[0]), uintptr(bytes))
 	runtime.KeepAlive(raw)
-	return &Tensor{g: g, buf: buf, shape: []int{len(raw)}}, nil
+	return &Tensor{g: g, buf: buf, shape: shape}, nil
 }
 
 // Embed looks every index up in t, a (vocab, dim) table, and returns the

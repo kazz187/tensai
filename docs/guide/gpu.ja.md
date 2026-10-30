@@ -69,6 +69,26 @@ out, _ = gq.MultiHeadAttention(gk, gv, heads)  // パックされた (batch, seq
 
 マルチヘッド attention はストライド付きカーネルでパックレイアウトから各ヘッドを切り出すので、permute は一切実体化されません。causal 版 (`CausalAttention`, `CausalMultiHeadAttention`) はカーネル内で未来位置をマスクし、k と v は q より多くの位置を持てます — 自己回帰モデルのプロンプトプレフィルとチャンクデコードのパターンです — のでマスクテンソルも作られません。`CausalMultiHeadAttention` は 1 回の融合 flash-attention 風ディスパッチ (kv タイル上のオンライン softmax、ヘッド次元 128 まで) で走ります: スコア行列は存在しないので、メモリはシーケンス長によらず q+k+v+出力 のままです。
 
+### パックした可変長の attention
+
+短いシーケンスをたくさん -- ゲームの局面のバッチ、長さの違う文 -- パディングなしで 1 回のディスパッチにできます: 行を順に詰め、詰め方を `NewSegments` で 1 度だけ記述し、それを各層の `SegmentAttention` に渡します:
+
+```go
+seg, _ := dev.NewSegments(rows, off, flags) // セグメント s は行 [off[s], off[s+1])。行ごとに gpu.RowFlag を 1 つ
+defer seg.Free()
+qkv, _ := y.Linear(wqkv, nil)               // (rows, 3d): すべての行の q|k|v
+att, _ := dev.SegmentAttention(gpu.SegAttn{
+	Seg: seg, Heads: heads, Dim: d,
+	Q: qkv, K: qkv, V: qkv, KCol: d, VCol: 2 * d, // 融合した射影の列をそのまま使う。コピーなし
+})
+```
+
+クエリは自分のセグメントのキーだけを見ます。`gpu.RowQueryOnly` の行はキーに入りません。`QRows` (詰めた行の番号の `UploadIndices` のリスト) を渡すと、最後の層が読むクエリ -- たとえば各セグメントの先頭の行 -- だけを計算し、`Q` はその行だけを持ちます。`Gate` (ヘッドごとの重み) は各セグメントのキーを `gpu.RowGated` のものと残りに分けます: クエリは残りのキーでの attention に、ゲートを通すキーだけでの attention の重み倍を足したものを得ます。`gpu.RowSeesAll` のクエリはいつもどおりすべてのキーを見ます。1 スレッドが (クエリ, ヘッド) 1 つをオンライン softmax で計算するのでスコアは存在せず、ワークグループの 64 個のクエリはキーと値をワークグループメモリに載せて共有します。ヘッドの次元は 4 の倍数で 128 までです。
+
+`PairDot` は行の組のスコア `scale * <t[ia[i]], o[ib[i]]>` を計算します。ポインタの頭は各選択肢をそのセグメントのクエリとデバイス上で掛け合わせられます。`DownloadInto`、`DownloadRangeInto`、`DownloadRowsInto` は呼び出し側が使い回すバッファへ結果を読み出します。最後のものは番号のリストが指す行だけを読みます。
+
+`LayerNorm` は 1024 列まで (4 の倍数) の行に、256 スレッドのワークグループ (狭い行ではほとんどが遊びます) の代わりに 8 スレッドずつを割り当てます: 128 列の 65536 行では Apple M5 で約 6 倍速く動きます。
+
 ## デバイス上の量子化重み
 
 `UploadQ8` は `QMatrix` を u32 あたり int8 重み 4 つでパックし、`gpu.QMatrix.MatMul` がレジスタ内で逆量子化するので、デコード matvec の転送は f32 の 1/4 バイトになります。`UploadQ4` は int4 の双子に同じことをするので、`-q4 -gpu` は int8 では収まらないモデルを動かせます。
