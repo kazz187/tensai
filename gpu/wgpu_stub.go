@@ -90,6 +90,9 @@ func (t *Tensor) MatMulT(o *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 // MatMulTN is a no-op stub; build with -tags wgpu or wgpu24.
 func (t *Tensor) MatMulTN(o *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
+// Linear always fails in builds without the wgpu tag.
+func (t *Tensor) Linear(w, bias *Tensor, act ...Act) (*Tensor, error) { return nil, errNoWGPU }
+
 // Scale always fails in builds without the wgpu tag.
 func (t *Tensor) Scale(s tensai.Float) error { return errNoWGPU }
 

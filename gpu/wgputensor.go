@@ -3008,6 +3008,7 @@ type gpuPipelines struct {
 	layAttnF16, layRowsToF16                       uintptr
 	qmatmulSK, qmatmulSKR, layQmatmulSK            uintptr
 	layQmatmulSKR                                  uintptr
+	gemm                                           []gemmPipe // per gemmTiles entry; nil without module4
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -3102,6 +3103,10 @@ func (g *Device) initPipelines() error {
 		g.hasIntDot = ok
 	}
 	uncapturedCB = ""
+	// The tiled GEMM module is optional too: without it every product
+	// runs on matmulWGSL's kernels.
+	g.initGemm()
+	uncapturedCB = ""
 	// The f16 module needs the shader-f16 device feature; failure to
 	// compile just leaves the f32 cache path.
 	if g.hasF16 {
@@ -3163,6 +3168,7 @@ func (g *Device) releasePipelines() {
 			fnPipelineRelease(h)
 		}
 	}
+	g.releaseGemm()
 }
 
 // dispatch runs one compute pass and pumps the error callback once; the
@@ -4011,7 +4017,7 @@ func (t *Tensor) Free() {
 // Device-resident tensor without any host transfer. Chain calls freely; only
 // Download moves data back.
 func (t *Tensor) MatMul(o *Tensor) (*Tensor, error) {
-	return t.matmul(o, gemmNN)
+	return t.matmul(o, gemmNN, gemmEpi{})
 }
 
 // MatMulT multiplies t by o with o's last two axes read transposed: a
@@ -4019,7 +4025,7 @@ func (t *Tensor) MatMul(o *Tensor) (*Tensor, error) {
 // (batch..., m, n), without materializing the transpose. This is the
 // attention pattern q @ k^T.
 func (t *Tensor) MatMulT(o *Tensor) (*Tensor, error) {
-	return t.matmul(o, gemmNT)
+	return t.matmul(o, gemmNT, gemmEpi{})
 }
 
 // MatMulTN multiplies t by o with t's last two axes read transposed: a
@@ -4028,7 +4034,7 @@ func (t *Tensor) MatMulT(o *Tensor) (*Tensor, error) {
 // activation transposed times the output gradient -- again without
 // materializing a transpose.
 func (t *Tensor) MatMulTN(o *Tensor) (*Tensor, error) {
-	return t.matmul(o, gemmTN)
+	return t.matmul(o, gemmTN, gemmEpi{})
 }
 
 // gemmMode selects which operand of a product is read transposed, matching
@@ -4041,7 +4047,7 @@ const (
 	gemmNT                 // a * b^T
 )
 
-func (t *Tensor) matmul(o *Tensor, mode gemmMode) (*Tensor, error) {
+func (t *Tensor) matmul(o *Tensor, mode gemmMode, epi gemmEpi) (*Tensor, error) {
 	if t.freed || o.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
@@ -4104,7 +4110,7 @@ func (t *Tensor) matmul(o *Tensor, mode gemmMode) (*Tensor, error) {
 	if mode == gemmNT {
 		ldb = k
 	}
-	return t.g.stridedMatMul(t, o, outShape, mode, m, k, n, batches, lda, ldb, n, offs)
+	return t.g.stridedMatMul(t, o, outShape, mode, m, k, n, batches, lda, ldb, n, offs, epi)
 }
 
 // stridedMatMul runs `batches` independent (m x k) x (k x n) products —
@@ -4113,13 +4119,17 @@ func (t *Tensor) matmul(o *Tensor, mode gemmMode) (*Tensor, error) {
 // allocated output, and lda/ldb/ldc are the row strides. Explicit strides
 // let callers carve sub-matrices out of a wider layout, which is how
 // multi-head attention splits heads without materializing a permute.
-func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k, n, batches, lda, ldb, ldc int, offs []uint32) (*Tensor, error) {
+//
+// A non-empty epi (bias, activation) needs the tiled kernels, which apply
+// it as they store; when they cannot take the product stridedMatMul
+// returns errNoTiledGemm and the caller runs the epilogue separately.
+func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k, n, batches, lda, ldb, ldc int, offs []uint32, epi gemmEpi) (*Tensor, error) {
 	if batches > 65535 {
 		return nil, fmt.Errorf("tensai: gpu matmul batch count %d exceeds 65535", batches)
 	}
 	params := [8]uint32{
 		uint32(m), uint32(k), uint32(n), uint32(batches),
-		uint32(lda), uint32(ldb), uint32(ldc), 0,
+		uint32(lda), uint32(ldb), uint32(ldc), epi.flags(),
 	}
 
 	g.mu.Lock()
@@ -4135,6 +4145,13 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
+	tile, tiled := 0, false
+	if mode == gemmNN {
+		tile, tiled = g.gemmFits(a, b, epi.bias, m, k, n, batches, lda, ldb, ldc, outBytes, offs, !epi.empty())
+	}
+	if !tiled && !epi.empty() {
+		return nil, errNoTiledGemm
+	}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
 	bufOut := g.takeOutBuffer(outBytes)
@@ -4143,6 +4160,18 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k
 
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
+
+	if tiled {
+		bias := epi.bias
+		if bias == nil {
+			bias = a // bound but unread: the flags leave the bias out
+		}
+		if err := g.dispatchGemm(tile, bufParams, bufOffs, uint64(len(offs))*4, a, b, bias, bufOut, outBytes, m, n, batches); err != nil {
+			g.dropBuffer(bufOut)
+			return nil, err
+		}
+		return &Tensor{g: g, buf: bufOut, shape: outShape}, nil
+	}
 
 	// The 64x64 register-tiled kernels win on big products. Skinny ones
 	// (m or n under half a block) would leave most of each workgroup
@@ -4427,7 +4456,7 @@ func (q *Tensor) multiHeadAttention(k, v *Tensor, heads int, causal bool) (*Tens
 		}
 	}
 	scores, err := q.g.stridedMatMul(q, k, []int{bh, seq, seqKV}, gemmNT,
-		seq, dh, seqKV, bh, d, d, seqKV, offs)
+		seq, dh, seqKV, bh, d, d, seqKV, offs, gemmEpi{})
 	if err != nil {
 		return nil, err
 	}
@@ -4458,7 +4487,7 @@ func (q *Tensor) multiHeadAttention(k, v *Tensor, heads int, causal bool) (*Tens
 	}
 	outShape := append(append([]int(nil), q.shape[:nq-2]...), seq, d)
 	return q.g.stridedMatMul(weights, v, outShape, gemmNN,
-		seq, seqKV, dh, bh, seqKV, d, d, offs2)
+		seq, seqKV, dh, bh, seqKV, d, d, offs2, gemmEpi{})
 }
 
 // fusedCausalMHA runs causal multi-head attention as one flash-attention

@@ -40,6 +40,7 @@ type Device struct {
 	module     uintptr
 	module2    uintptr // optional integer-dot module; 0 if unsupported
 	module3    uintptr // optional f16 module; 0 if unsupported
+	module4    uintptr // optional tiled-GEMM module; 0 if it did not compile
 	hasIntDot  bool
 	hasF16     bool
 	pipes      gpuPipelines
@@ -531,6 +532,10 @@ func (g *Device) makeModuleFrom(src string) uintptr {
 	return m
 }
 
+// makeModuleTrusted is makeModuleFrom: the v22 API has no way to drop
+// wgpu's runtime shader checks.
+func (g *Device) makeModuleTrusted(src string) uintptr { return g.makeModuleFrom(src) }
+
 // makePipelineIn builds a compute pipeline for one entry point of an
 // explicit module.
 func (g *Device) makePipelineIn(module uintptr, entry string) uintptr {
@@ -590,6 +595,7 @@ func (g *Device) closeLocked() {
 		fn func(uintptr)
 		h  uintptr
 	}{
+		{fnShaderModRelease, g.module4},
 		{fnShaderModRelease, g.module3},
 		{fnShaderModRelease, g.module2},
 		{fnShaderModRelease, g.module},

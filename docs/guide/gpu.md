@@ -50,6 +50,14 @@ result, _ := out.Download()         // one readback at the end
 
 Residency matters most on discrete GPUs, where every transfer crosses PCIe; on shared-memory iGPUs the win is smaller and comes mainly from skipping intermediate readbacks.
 
+Products whose k and n are multiples of four -- every width of a usual model -- run on tiled kernels: 256 threads per workgroup, an 8x8 or 4x4 register tile per thread, vec4 loads and stores, and the next k slab fetched into registers while the current one is multiplied. With wgpu-native v29 they are compiled without wgpu's runtime checks (a clamp on every storage index, a counter on every loop), and the host checks every operand's extent against its buffer before a dispatch instead. `Linear` folds a dense layer into one of them:
+
+```go
+y, _ := gx.Linear(gw, gb, gpu.ActReLU) // relu(x*w + b), one dispatch, no intermediate
+```
+
+The bias add and the activation happen as the product is stored. When the product does not fit the tiled kernels, `Linear` runs `MatMul`, `Binary` and `Activate` instead, with the same result. On an NVIDIA RTX PRO 4000 Blackwell (Vulkan) the products of a width-128 transformer over a few thousand rows run at 12-13 TFLOPS, against 5-6 on the previous 64x64 kernels, and 2048x2048x2048 at 17 against 6.7; on an Apple M5 (Metal) they run at about 1.9 TFLOPS against 1.0.
+
 ## Attention on the device
 
 Beyond MatMul, resident tensors support `MatMulT`, an in-place `Scale`, and a row-parallel `Softmax` over the last axis — enough to run single-head attention entirely on the GPU:

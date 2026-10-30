@@ -45,6 +45,7 @@ type Device struct {
 	module     uintptr
 	module2    uintptr // optional integer-dot module; 0 if unsupported
 	module3    uintptr // optional f16 module; 0 if unsupported
+	module4    uintptr // optional tiled-GEMM module; 0 if it did not compile
 	hasIntDot  bool
 	hasF16     bool
 	pipes      gpuPipelines
@@ -308,7 +309,22 @@ var (
 	fnDeviceRelease           func(uintptr)
 	fnAdapterRelease          func(uintptr)
 	fnInstanceRelease         func(uintptr)
+
+	// fnDeviceCreateShaderModTrusted is nil when the library lacks it.
+	fnDeviceCreateShaderModTrusted func(uintptr, *wgpuShaderModuleDescriptor, uint64) uintptr
 )
+
+// registerOptional is purego.RegisterLibFunc for a symbol the library may
+// not export, which RegisterLibFunc answers with a panic.
+func registerOptional(fptr any, lib uintptr, name string) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	purego.RegisterLibFunc(fptr, lib, name)
+	return true
+}
 
 // Callback plumbing, identical in spirit to the v22 file: NewCallback slots
 // are permanent, created once, routed through globals under wgpuMu.
@@ -436,6 +452,8 @@ func loadWGPU() error {
 			purego.RegisterLibFunc(f.ptr, lib, f.name)
 		}
 		registerCallInfoFns(lib)
+		// Optional: only some v24+ releases export it.
+		registerOptional(&fnDeviceCreateShaderModTrusted, lib, "wgpuDeviceCreateShaderModuleTrusted")
 
 		// New-API callbacks receive WGPUStringView messages by value; on
 		// SysV/AAPCS a 16-byte aggregate arrives as two register words, so
@@ -637,6 +655,29 @@ func (g *Device) makeModuleFrom(src string) uintptr {
 	return m
 }
 
+// makeModuleTrusted compiles a module the way makeModuleFrom does, but
+// without the checks wgpu otherwise adds to every shader: a clamp or a
+// test on every storage-buffer index, and a counter on every loop. The
+// module's own index arithmetic must then keep every access in bounds.
+// Libraries without wgpuDeviceCreateShaderModuleTrusted, and a set
+// gemmChecked, get the checked module.
+func (g *Device) makeModuleTrusted(src string) uintptr {
+	if fnDeviceCreateShaderModTrusted == nil || gemmChecked {
+		return g.makeModuleFrom(src)
+	}
+	code, codeBuf := sv(src)
+	wgsl := wgpuShaderSourceWGSL{
+		chain: wgpuChainedStruct{sType: wgpuSTypeShaderSourceWGSL},
+		code:  code,
+	}
+	smDesc := wgpuShaderModuleDescriptor{nextInChain: &wgsl}
+	m := fnDeviceCreateShaderModTrusted(g.device, &smDesc, 0) // WGPUShaderRuntimeChecks_None
+	runtime.KeepAlive(&wgsl)
+	runtime.KeepAlive(&smDesc)
+	runtime.KeepAlive(codeBuf)
+	return m
+}
+
 // makePipelineIn builds a compute pipeline for one entry point of an
 // explicit module.
 func (g *Device) makePipelineIn(module uintptr, entry string) uintptr {
@@ -698,6 +739,7 @@ func (g *Device) closeLocked() {
 		fn func(uintptr)
 		h  uintptr
 	}{
+		{fnShaderModRelease, g.module4},
 		{fnShaderModRelease, g.module3},
 		{fnShaderModRelease, g.module2},
 		{fnShaderModRelease, g.module},
