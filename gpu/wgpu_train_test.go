@@ -20,7 +20,8 @@ func checkClose(t *testing.T, name string, got *tensai.Tensor, want []tensai.Flo
 		t.Fatalf("%s: got %d elements, want %d", name, len(got.Data), len(want))
 	}
 	for i := range want {
-		if diff := math.Abs(float64(got.Data[i] - want[i])); diff > tol*(1+math.Abs(float64(want[i]))) {
+		// Negated so that a NaN on either side fails too.
+		if diff := math.Abs(float64(got.Data[i] - want[i])); !(diff <= tol*(1+math.Abs(float64(want[i])))) {
 			t.Fatalf("%s element %d: gpu=%v cpu=%v", name, i, got.Data[i], want[i])
 		}
 	}
@@ -273,6 +274,8 @@ func TestGPUActivations(t *testing.T) {
 	rng := rand.New(rand.NewPCG(37, 0))
 
 	x := randTensor(rng, 4, 16)
+	// Saturated inputs too: Metal's tanh returned 0 at 44 and NaN at 100.
+	copy(x.Data, []tensai.Float{-100, -44, -20, -9, 9, 20, 44, 100})
 	grad := randTensor(rng, 4, 16)
 	gx, ggrad := upload2(t, g, x, grad)
 	defer gx.Free()
@@ -338,6 +341,32 @@ func TestGPUActivations(t *testing.T) {
 		}
 		checkClose(t, a.name+" backward", gotG, want, 1e-5)
 	}
+}
+
+// TestGPUGeluMulSaturated checks the tanh-approximated GELU gate past the
+// range where Metal's tanh breaks down (0 at 44, NaN at 100).
+func TestGPUGeluMulSaturated(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	x, _ := tensai.NewTensorFromSlice([]tensai.Float{-100, -44, -9, -1, 0, 1, 9, 44, 100, 3, 6, 20}, 12)
+	o, _ := tensai.NewTensorFromSlice([]tensai.Float{2, 0.5, -1, 3}, 4)
+	gx, gw := upload2(t, g, x, o)
+	defer gx.Free()
+	defer gw.Free()
+	if err := gx.GeluMul(gw); err != nil {
+		t.Fatal(err)
+	}
+	got, err := gx.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]tensai.Float, len(x.Data))
+	for i, v := range x.Data {
+		f := float64(v)
+		gelu := 0.5 * f * (1 + math.Tanh(0.7978845608028654*(f+0.044715*f*f*f)))
+		want[i] = tensai.Float(gelu) * o.Data[i%len(o.Data)]
+	}
+	checkClose(t, "gelu_mul", got, want, 1e-5)
 }
 
 // TestGPUSumCols checks the reduction a broadcast operand's gradient uses.

@@ -1654,10 +1654,17 @@ fn erff(x: f32) -> f32 {
     return s * y;
 }
 
+// tanh_sat is tanh with its argument clamped: Metal's tanh returns 0 at
+// 44 and NaN at 100, where it should be 1, and the clamp changes nothing
+// else -- tanh(15) is 1 in f32.
+fn tanh_sat(x: f32) -> f32 {
+    return tanh(clamp(x, -15.0, 15.0));
+}
+
 fn act_of(x: f32, mode: u32) -> f32 {
     switch mode {
         case 0u: { return max(x, 0.0); }                        // relu
-        case 1u: { return tanh(x); }
+        case 1u: { return tanh_sat(x); }
         case 2u: { return 1.0 / (1.0 + exp(-x)); }              // sigmoid
         default: { return 0.5 * x * (1.0 + erff(x * 0.7071067811865476)); } // gelu
     }
@@ -1670,7 +1677,7 @@ fn act_grad_of(x: f32, mode: u32) -> f32 {
             return 0.0;
         }
         case 1u: {
-            let y = tanh(x);
+            let y = tanh_sat(x);
             return 1.0 - y * y;
         }
         case 2u: {
@@ -2129,7 +2136,7 @@ fn glu_split(@builtin(workgroup_id) wg: vec3<u32>,
         var a = g / (1.0 + exp(-g));
         if (gsp.gelu != 0u) {
             let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
-            a = 0.5 * g * (1.0 + tanh(inner));
+            a = 0.5 * g * (1.0 + tanh_sat(inner));
         }
         sldst[idx] = a * u;
     }
@@ -2144,7 +2151,7 @@ fn gelu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
     if (idx < ep.count) {
         let g = edst[idx];
         let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
-        edst[idx] = 0.5 * g * (1.0 + tanh(inner)) * esrc[idx % ep.srcCount];
+        edst[idx] = 0.5 * g * (1.0 + tanh_sat(inner)) * esrc[idx % ep.srcCount];
     }
 }
 

@@ -41,7 +41,7 @@ func checkProduct(t *testing.T, what string, got, want *tensai.Tensor, k int) {
 	tol := 1e-5 * math.Sqrt(float64(k)) * 8
 	for i := range want.Data {
 		w := float64(want.Data[i])
-		if diff := math.Abs(float64(got.Data[i]) - w); diff > tol*(1+math.Abs(w)) {
+		if diff := math.Abs(float64(got.Data[i]) - w); !(diff <= tol*(1+math.Abs(w))) { // NaN fails too
 			t.Fatalf("%s element %d: gpu=%v cpu=%v", what, i, got.Data[i], want.Data[i])
 		}
 	}
