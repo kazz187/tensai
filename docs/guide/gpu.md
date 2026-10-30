@@ -33,6 +33,8 @@ out, err := dev.MatMul(a, b)
 
 On machines with both an integrated and a discrete GPU, pass a preference: `gpu.Open(gpu.LowPower)` steers to the iGPU, `gpu.HighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
 
+`dev.Adapter()` reports what `Open` picked — name, backend (`Vulkan`, `Metal`, `D3D12`, ...), PCI vendor ID, and type — and `Adapter().Software()` tells a CPU implementation (llvmpipe, lavapipe, WARP) from a GPU. wgpu falls back to one without a word when the GPU's driver is not found; on Linux a Vulkan loader that cannot see the vendor's ICD hands out llvmpipe. Set `TENSAI_WGPU_REQUIRE_HW=1` to make `Open` fail instead of running there.
+
 ## Resident buffers
 
 `dev.MatMul(a, b)` is shorthand for Upload → MatMul → Download → Free. Buffers can instead stay resident on the GPU, so a weight rides the bus once instead of on every call and intermediates never leave the device:

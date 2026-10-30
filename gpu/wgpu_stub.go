@@ -56,6 +56,9 @@ func Backend() string { return "" }
 // Name always returns "" in builds without the wgpu tag.
 func (g *Device) Name() string { return "" }
 
+// Adapter returns the zero AdapterInfo in builds without the wgpu tag.
+func (g *Device) Adapter() AdapterInfo { return AdapterInfo{} }
+
 // MatMul always fails in builds without the wgpu tag.
 func (g *Device) MatMul(a, b *tensai.Tensor) (*tensai.Tensor, error) { return nil, errNoWGPU }
 

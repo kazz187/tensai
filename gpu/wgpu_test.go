@@ -93,6 +93,58 @@ func TestGPUAdapterSelection(t *testing.T) {
 	}
 }
 
+// TestGPUAdapterInfo checks that Open reports the adapter it picked and
+// that TENSAI_WGPU_REQUIRE_HW refuses a software one -- and only that.
+func TestGPUAdapterInfo(t *testing.T) {
+	t.Setenv("TENSAI_WGPU_REQUIRE_HW", "")
+	g := openTestGPU(t)
+	info := g.Adapter()
+	g.Close()
+	t.Logf("adapter: %s, software=%v, vendor %q, architecture %q, description %q",
+		info, info.Software(), info.Vendor, info.Architecture, info.Description)
+	if info.Backend == "" || info.Backend == "unknown" {
+		t.Errorf("backend not reported: %+v", info)
+	}
+	if info.Name == "" && info.Description == "" {
+		t.Errorf("adapter has neither a name nor a description: %+v", info)
+	}
+
+	t.Setenv("TENSAI_WGPU_REQUIRE_HW", "1")
+	g2, err := Open()
+	if info.Software() {
+		if err == nil {
+			g2.Close()
+			t.Fatal("TENSAI_WGPU_REQUIRE_HW=1 accepted a software adapter")
+		}
+		t.Logf("refused as it should be: %v", err)
+	} else {
+		if err != nil {
+			t.Fatalf("TENSAI_WGPU_REQUIRE_HW=1 refused a hardware adapter: %v", err)
+		}
+		g2.Close()
+	}
+
+	t.Setenv("TENSAI_WGPU_REQUIRE_HW", "maybe")
+	if g3, err := Open(); err == nil {
+		g3.Close()
+		t.Fatal("Open accepted TENSAI_WGPU_REQUIRE_HW=maybe")
+	}
+
+	for _, c := range []struct {
+		info AdapterInfo
+		want bool
+	}{
+		{AdapterInfo{Name: "llvmpipe (LLVM 15.0.7, 256 bits)", Type: AdapterCPU}, true},
+		{AdapterInfo{Name: "llvmpipe (LLVM 15.0.7, 256 bits)"}, true},
+		{AdapterInfo{Name: "NVIDIA RTX PRO 4000 Blackwell", Type: AdapterDiscrete}, false},
+		{AdapterInfo{Name: "Apple M5", Type: AdapterIntegrated}, false},
+	} {
+		if got := c.info.Software(); got != c.want {
+			t.Errorf("%s: Software() = %v, want %v", c.info, got, c.want)
+		}
+	}
+}
+
 // TestGPUOpenFailureReturns makes Open fail after it has taken wgpuMu --
 // the module it compiles is not WGSL -- and checks that the failure comes
 // back as an error. Open used to back out through Close, which takes

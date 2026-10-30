@@ -58,6 +58,7 @@ type Device struct {
 	uarOff     uint64
 	offsCache  map[string]uintptr // resident attention-offset buffers
 	name       string
+	info       AdapterInfo
 	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
 	closed     bool
 }
@@ -528,17 +529,33 @@ func open(src string, power ...Power) (*Device, error) {
 	var info wgpuAdapterInfo
 	fnAdapterGetInfo(g.adapter, &info)
 	runtime.KeepAlive(&info)
-	g.name = viewString(info.device)
+	g.info = AdapterInfo{
+		Name:         viewString(info.device),
+		Description:  viewString(info.description),
+		Vendor:       viewString(info.vendor),
+		Architecture: viewString(info.architecture),
+		Backend:      backendName(info.backendType),
+		VendorID:     info.vendorID,
+		DeviceID:     info.deviceID,
+	}
+	g.name = g.info.Name
 	if g.name == "" {
-		g.name = viewString(info.description)
+		g.name = g.info.Description
 	}
 	switch info.adapterType {
 	case 1:
+		g.info.Type = AdapterDiscrete
 		g.name += " (discrete)"
 	case 2:
+		g.info.Type = AdapterIntegrated
 		g.name += " (integrated)"
 	case 3:
+		g.info.Type = AdapterCPU
 		g.name += " (cpu)"
+	}
+	if err := requireHardware(g.info); err != nil {
+		g.closeLocked()
+		return nil, err
 	}
 
 	// Request the adapter's own limits back so big storage buffers are not
@@ -653,6 +670,10 @@ func Backend() string { return "wgpu24" }
 // Radeon(TM) Graphics) (integrated)" — handy for checking which Device a power
 // preference landed on.
 func (g *Device) Name() string { return g.name }
+
+// Adapter describes the adapter Open picked: its backend, vendor, and
+// whether it is a GPU at all (see AdapterInfo.Software).
+func (g *Device) Adapter() AdapterInfo { return g.info }
 
 // Close releases the device and every object Open created. The Device must
 // not be used afterwards.

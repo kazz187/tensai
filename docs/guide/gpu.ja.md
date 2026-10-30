@@ -33,6 +33,8 @@ out, err := dev.MatMul(a, b)
 
 iGPU と dGPU の両方があるマシンでは希望を渡せます: `gpu.Open(gpu.LowPower)` は iGPU へ、`gpu.HighPerformance` は dGPU へ寄せます (ヒントです — アダプタが 1 つならそれが返ります)。
 
+`dev.Adapter()` は `Open` が選んだアダプタ — 名前、バックエンド (`Vulkan`、`Metal`、`D3D12` など)、PCI ベンダー ID、種類 — を返し、`Adapter().Software()` は CPU 実装 (llvmpipe、lavapipe、WARP) を GPU と見分けます。wgpu は GPU のドライバが見つからないと黙ってそちらに落ちます。Linux では、Vulkan ローダーがベンダーの ICD を見つけられないと llvmpipe が返ります。`TENSAI_WGPU_REQUIRE_HW=1` を設定すると、`Open` はそこで動かずに失敗します。
+
 ## 常駐バッファ
 
 `dev.MatMul(a, b)` は Upload → MatMul → Download → Free の省略形です。バッファを GPU に常駐させれば、重みはバスを 1 回しか渡らず、中間結果はデバイスを離れません:
