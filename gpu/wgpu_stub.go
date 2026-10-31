@@ -329,5 +329,17 @@ func (t *Tensor) DownloadInto(dst []tensai.Float) error { return errNoWGPU }
 // DownloadRangeInto always fails in builds without the wgpu tag.
 func (t *Tensor) DownloadRangeInto(off int, dst []tensai.Float) error { return errNoWGPU }
 
+// PendingDownload is a download in flight; unused in builds without the
+// wgpu tag.
+type PendingDownload struct{}
+
+// BeginDownloadRangeInto always fails in builds without the wgpu tag.
+func (t *Tensor) BeginDownloadRangeInto(off int, dst []tensai.Float) (*PendingDownload, error) {
+	return nil, errNoWGPU
+}
+
+// Wait always fails in builds without the wgpu tag.
+func (r *PendingDownload) Wait() error { return errNoWGPU }
+
 // DownloadRowsInto always fails in builds without the wgpu tag.
 func (t *Tensor) DownloadRowsInto(ids *Tensor, dst []tensai.Float) error { return errNoWGPU }

@@ -29,8 +29,9 @@ import (
 )
 
 // Device is a WebGPU device with a compiled matmul pipeline. Open one with
-// Open, use it from any goroutine (calls are serialized internally), and
-// Close it when done.
+// Open, use it from any goroutine (calls are serialized internally, except
+// that a download waits for the GPU outside that: see readback_wgpu.go),
+// and Close it when done.
 type Device struct {
 	mu         sync.Mutex
 	instance   uintptr
@@ -44,7 +45,9 @@ type Device struct {
 	hasIntDot  bool
 	hasF16     bool
 	pipes      gpuPipelines
-	readback   gpuReadbackBuffer
+	readbacks  []gpuReadbackBuffer           // idle staging buffers, see takeReadback
+	downloads  map[*PendingDownload]struct{} // begun and not yet waited
+	waits      gpuWaits                      // mappings in flight, see readback_wgpu.go
 	pool       gpuBufferPool
 	bgCache    map[bgKey]uintptr
 	batchEnc   uintptr // open command encoder while batching, see BeginBatch
@@ -56,7 +59,8 @@ type Device struct {
 	name       string
 	info       AdapterInfo
 	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
-	closed     bool
+	closed     bool   // no new operation may start
+	released   bool   // closeLocked has released everything
 }
 
 // Power tells Open which adapter to prefer on machines with more than
@@ -232,7 +236,7 @@ var (
 	fnEncoderFinish           func(uintptr, unsafe.Pointer) uintptr
 	fnQueueSubmit             func(uintptr, uintptr, unsafe.Pointer)
 	fnQueueWriteBuffer        func(uintptr, uintptr, uint64, unsafe.Pointer, uintptr)
-	fnBufferMapAsync          func(uintptr, uint32, uintptr, uintptr, uintptr, unsafe.Pointer)
+	fnBufferMapAsync          func(uintptr, uint32, uintptr, uintptr, uintptr, uintptr)
 	fnBufferGetConstMapped    func(uintptr, uintptr, uintptr) unsafe.Pointer
 	fnBufferUnmap             func(uintptr)
 	fnDevicePoll              func(uintptr, uint32, unsafe.Pointer) uint32
@@ -252,7 +256,12 @@ var (
 
 // Callback plumbing. NewCallback slots are permanent, so they are created
 // once and route their results through package globals; wgpuMu serializes
-// every wgpu call sequence that uses them.
+// every wgpu call sequence that uses them. The adapter, device and
+// uncaptured-error callbacks fire synchronously inside the call that
+// causes them, and every such call is made under wgpuMu. Map callbacks are
+// the exception: they fire in whichever call next processes the device's
+// completed work, including the readback poller's polls, which run without
+// wgpuMu, so they report through the registry in readback_wgpu.go instead.
 var (
 	wgpuMu       sync.Mutex
 	loadOnce     sync.Once
@@ -260,8 +269,6 @@ var (
 	cbAdapter    uintptr
 	cbDevice     uintptr
 	cbFailMsg    string
-	cbMapDone    bool
-	cbMapOK      bool
 	uncapturedCB string
 
 	adapterCB, deviceCB, mapCB, errorCB uintptr
@@ -387,8 +394,12 @@ func loadWGPU() error {
 			return 0
 		})
 		mapCB = purego.NewCallback(func(status uint32, userdata uintptr) uintptr {
-			cbMapDone = true
-			cbMapOK = status == wgpuStatusSuccess
+			ok := status == wgpuStatusSuccess
+			var msg string
+			if !ok {
+				msg = fmt.Sprintf("map status %d", status)
+			}
+			mapDone(userdata, ok, msg)
 			return 0
 		})
 		errorCB = purego.NewCallback(func(errType uint32, message, userdata uintptr) uintptr {
@@ -572,22 +583,28 @@ func (g *Device) Name() string { return g.name }
 // whether it is a GPU at all (see AdapterInfo.Software).
 func (g *Device) Adapter() AdapterInfo { return g.info }
 
-// Close releases the device and every object Open created. The Device must
-// not be used afterwards.
+// Close releases the device and every object Open created, after the
+// downloads in flight have landed. The Device must not be used afterwards.
 func (g *Device) Close() {
+	if !g.beginClose() {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	wgpuMu.Lock()
 	defer wgpuMu.Unlock()
 	g.closeLocked()
 }
 
-// closeLocked is Close for a caller that already holds wgpuMu -- Open,
-// backing out of a device it could not finish. wgpuMu is not reentrant,
-// so calling Close there would wait on the lock Open itself holds.
+// closeLocked is the release half of Close for a caller that already
+// holds wgpuMu -- Close, or Open backing out of a device it could not
+// finish. wgpuMu is not reentrant, so calling Close there would wait on
+// the lock Open itself holds.
 func (g *Device) closeLocked() {
-	if g.closed {
+	if g.released {
 		return
 	}
-	g.closed = true
+	g.closed, g.released = true, true
 	g.releaseReadback()
 	g.releasePool()
 	g.releasePipelines()
@@ -628,20 +645,12 @@ func (g *Device) makeBindGroup(layout uintptr, entries []wgpuBindGroupEntry) uin
 	return bg
 }
 
-// mapRead blocks until buf (usage MapRead) is mapped and returns the mapped
-// range; the caller must fnBufferUnmap when done.
-func (g *Device) mapRead(buf uintptr, bytes uint64) (unsafe.Pointer, error) {
-	cbMapDone, cbMapOK = false, false
-	fnBufferMapAsync(buf, wgpuMapModeRead, 0, uintptr(bytes), mapCB, nil)
-	for !cbMapDone {
-		fnDevicePoll(g.device, 1, nil)
-	}
-	if !cbMapOK {
-		return nil, fmt.Errorf("tensai: gpu readback failed: %s", uncapturedCB)
-	}
-	src := fnBufferGetConstMapped(buf, 0, uintptr(bytes))
-	if src == nil {
-		return nil, errors.New("tensai: gpu readback: mapped range unavailable")
-	}
-	return src, nil
+// mapForRead asks for the first bytes of buf (usage MapRead) to be mapped;
+// the callback reports to mapDone with id.
+func (g *Device) mapForRead(buf uintptr, bytes uint64, id uintptr) {
+	fnBufferMapAsync(buf, wgpuMapModeRead, 0, uintptr(bytes), mapCB, id)
 }
+
+// pollDevice processes the device's completed work without blocking,
+// firing the callbacks it makes ready.
+func (g *Device) pollDevice() { fnDevicePoll(g.device, 0, nil) }

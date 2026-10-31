@@ -3820,48 +3820,6 @@ func (g *Device) NewF16Tensor(shape ...int) (*Tensor, error) {
 // copyable in (Upload) and out (Download).
 const gpuTensorUsage = wgpuBufferUsageStorage | wgpuBufferUsageCopySrc | wgpuBufferUsageCopyDst
 
-// gpuReadbackBuffer is the reusable MapRead staging buffer. Downloads are
-// serialized by Device.mu and wgpuMu, and mapRead waits for the copy to finish,
-// so the buffer is idle again before it is returned to this slot.
-type gpuReadbackBuffer struct {
-	buf  uintptr
-	size uint64
-}
-
-// takeReadback returns an unmapped staging buffer at least bytes large. The
-// single retained buffer grows to the largest download seen by this Device.
-// The caller holds Device.mu and wgpuMu.
-func (g *Device) takeReadback(bytes uint64) (uintptr, uint64) {
-	if g.readback.buf != 0 && g.readback.size >= bytes {
-		buf, capacity := g.readback.buf, g.readback.size
-		g.readback = gpuReadbackBuffer{}
-		return buf, capacity
-	}
-	if g.readback.buf != 0 {
-		g.dropBuffer(g.readback.buf)
-		g.readback = gpuReadbackBuffer{}
-	}
-	return g.newBuffer(wgpuBufferUsageMapRead|wgpuBufferUsageCopyDst, bytes), bytes
-}
-
-// putReadback retains a successfully unmapped staging buffer for the next
-// download. The caller holds Device.mu and wgpuMu.
-func (g *Device) putReadback(buf uintptr, size uint64) {
-	if g.readback.buf != 0 {
-		g.dropBuffer(g.readback.buf)
-	}
-	g.readback = gpuReadbackBuffer{buf: buf, size: size}
-}
-
-// releaseReadback drops the retained staging buffer during Device.Close. The
-// caller holds wgpuMu.
-func (g *Device) releaseReadback() {
-	if g.readback.buf != 0 {
-		fnBufferRelease(g.readback.buf)
-	}
-	g.readback = gpuReadbackBuffer{}
-}
-
 // StorageLimit reports how many bytes a single Device buffer may hold under
 // the device limits negotiated at Open time (0 when unknown). tensai.Tensor
 // operations return an error instead of touching the driver when a buffer
@@ -3934,50 +3892,6 @@ func (t *Tensor) DownloadRange(off, n int) (*tensai.Tensor, error) {
 		return nil, err
 	}
 	return out, nil
-}
-
-// readInto copies len(dst) elements of t starting at element off into
-// dst, flushing an open batch first: the work behind Download,
-// DownloadRange and their Into forms, whose callers check the range.
-func (t *Tensor) readInto(off int, dst []tensai.Float) error {
-	g := t.g
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	wgpuMu.Lock()
-	defer wgpuMu.Unlock()
-	if g.closed {
-		return errors.New("tensai: gpu is closed")
-	}
-	if err := g.flushLocked(); err != nil {
-		return err
-	}
-	bytes := uint64(len(dst)) * 4
-	staging, stagingSize := g.takeReadback(bytes)
-	if staging == 0 {
-		return errors.New("tensai: gpu readback buffer allocation failed")
-	}
-	reuse := false
-	defer func() {
-		if reuse {
-			g.putReadback(staging, stagingSize)
-		} else {
-			fnBufferRelease(staging)
-		}
-	}()
-	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
-	fnEncoderCopyBuffer(encoder, t.buf, t.off+uint64(off)*4, staging, 0, bytes)
-	cmd := fnEncoderFinish(encoder, nil)
-	fnCmdEncoderRelease(encoder)
-	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
-	fnCmdBufferRelease(cmd)
-	src, err := g.mapRead(staging, bytes)
-	if err != nil {
-		return err
-	}
-	copy(dst, unsafe.Slice((*tensai.Float)(src), len(dst)))
-	fnBufferUnmap(staging)
-	reuse = true
-	return nil
 }
 
 // Free releases the Device buffer (into the transient pool, from which the
